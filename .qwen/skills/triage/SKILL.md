@@ -84,14 +84,36 @@ decide whether to stop, continue, or hand off.
 | Judgment Gate | Decide whether the item is well-formed and directionally useful | PR template/evidence/product/scope/history, or issue type/completeness/labels/related/product direction/bug evidence                    |
 | Route Gate    | Choose the next action without overreaching                     | no-action, need-information, need-retesting, related, welcome-pr, bugfix handoff, maintainer discussion, or code-review handoff         |
 
-The gates are progressive:
+The gates are progressive and strictly sequential:
 
+- Each gate depends on the output of the previous gate. Do not skip ahead.
 - If Context blocks side effects, still complete dry-run analysis but recommend
   `no-action` unless the user asks for override.
 - If Judgment finds missing PR evidence or missing issue facts, stop there and
   ask for the smallest useful clarification.
 - Only route to code review or bugfix after intake/triage has enough evidence
   and no product-direction decision is still unresolved.
+
+### Route Gate Decision Order
+
+Evaluate route conditions in this order. Stop at the first match:
+
+1. **need-information** — critical facts missing (version, OS, reproduction).
+2. **need-retesting** — reported version is ≥6 stable releases behind.
+3. **related** — same root cause or highly similar issue found.
+4. **auto-fix** — bug with high-confidence root cause, fix is localized to ≤3
+   files, change is mechanical, existing tests cover the area. Typical: missing
+   null check, missing CLI flag, inverted condition.
+5. **welcome-pr** — bug with clear root cause, moderate fix effort, contributor
+   does not need maintainer-only decisions. Not applicable when the fix touches
+   auth, sandbox, model selection, telemetry, or public contracts.
+6. **maintainer-discussion** — product direction is uncertain, AI confidence is
+   insufficient, or the change affects core architecture / auth / model /
+   daemon / release / public contracts. Action: comment @ the relevant domain
+   maintainer, add `need-discussion` + `status/ready-for-human`, attach the
+   AI's preliminary analysis for context.
+7. **code-review** — PR intake passes all four dimensions, hand off to review.
+8. **no-action** — labels only, no comment needed.
 
 ## Dry-Run Report
 
@@ -251,6 +273,9 @@ Soft-blocking triggers:
 
 ### P-4: Draft Response
 
+Before drafting, load `references/tone-guide.md` and verify all proposed labels
+exist via `gh label list --repo QwenLM/qwen-code --limit 300`.
+
 Draft one PR comment starting with:
 
 ```markdown
@@ -405,6 +430,9 @@ The markers are part of the public comment draft. Do not omit them from dry-run
 drafts, because maintainers need to see exactly what would be posted.
 
 ### I-6: Apply With Confirmation
+
+Before drafting the final comment, load `references/tone-guide.md` and verify
+all proposed labels exist via `gh label list --repo QwenLM/qwen-code --limit 300`.
 
 Show:
 

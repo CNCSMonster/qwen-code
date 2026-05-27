@@ -75,6 +75,13 @@ new framework code. Route to maintainer discussion when the request affects
 auth, sandboxing, model/provider selection, daemon/remote execution, telemetry,
 release flow, public contracts, or long-term product positioning.
 
+When routing to maintainer-discussion:
+
+- @ the relevant domain maintainer in the comment.
+- Add `need-discussion` + `status/ready-for-human`.
+- Include the AI's preliminary product direction analysis for context.
+- This also applies when AI confidence on product direction is insufficient.
+
 Use `welcome-pr` for feature requests only when:
 
 - The product direction is `aligned`.
