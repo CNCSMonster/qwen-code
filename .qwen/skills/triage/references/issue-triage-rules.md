@@ -29,7 +29,7 @@ Keep these responsibilities separate:
 | Label triage     | Existing labels only                                          | Comments, closing, assignment, body edits |
 | Follow-up        | Conservative comments, related issue links, missing-info asks | Full label retagging, closing, assignment |
 | Auto-fix routing | Asking whether to invoke `/qc bugfix`                         | Implementing the fix inside triage        |
-| Prior handling   | Preventing duplicate side effects                             | Suppressing dry-run analysis              |
+| Prior handling   | Preventing duplicate side effects                             | Suppressing the staged report             |
 
 When in doubt, do the label plan first and draft follow-up separately.
 
@@ -49,8 +49,9 @@ Use one `type/*` label.
 
 ## Feature Request Product Direction
 
-Feature requests need product judgment, not only labels. In dry-run, always
-produce the judgment even when the issue already has labels or follow-up.
+Feature requests need product judgment, not only labels. Always produce the
+judgment in the staged report, even when the issue already has labels or
+follow-up.
 
 Use these verdicts:
 
@@ -251,12 +252,12 @@ For PR-only actions that the issue followup bot does not handle:
 
 ## Prior Handling And Side Effects
 
-Prior handling blocks duplicate GitHub side effects; it does not block dry-run
-analysis. Continue classifying, checking labels, and judging product direction or
-diagnosis in dry-run.
+Prior handling blocks duplicate GitHub side effects; it never blocks analysis.
+Continue classifying, checking labels, and judging product direction or
+diagnosis, and produce the full staged report.
 
-Do not add labels or comments unless the user explicitly asks for manual
-override when any of these are true:
+Skip the `gh issue edit` and `gh issue comment` calls (but still print the
+staged report) when any of these are true:
 
 - Closed issue.
 - Pull request.
@@ -265,6 +266,9 @@ override when any of these are true:
 - Existing Qwen bot follow-up.
 - Existing marker comment.
 - `status/in-progress` or `status/blocked`.
+
+If the maintainer wants to override, they can copy the `gh` commands from the
+staged report and run them manually.
 
 ## Label Rules
 

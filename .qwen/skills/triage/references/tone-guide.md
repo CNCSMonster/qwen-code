@@ -116,7 +116,7 @@ Direction decline:
 
 ## Public Comment Distillation
 
-The dry-run report can include stages, verdicts, label plans, and uncertainty.
+The staged report can include stages, verdicts, label plans, and uncertainty.
 The public comment should not. Rewrite it as a short maintainer note:
 
 1. Acknowledge the concrete proposal or change.
@@ -157,7 +157,7 @@ PR missing checks:
 > Once those are in the PR body, the code review can focus on the implementation
 > instead of reconstructing the intent from the diff.
 
-## Dry-Run Report Examples
+## Staged Report Examples
 
 Feature request product fit:
 
@@ -176,9 +176,9 @@ Prior handling:
 > **Stage 1: Intake Gate**
 >
 > Prior handling exists: a maintainer/bot already added a substantive follow-up.
-> I will still complete the dry-run classification and product-direction
-> assessment, but the side-effect recommendation is `no-action` unless a
-> maintainer asks for override.
+> The classification and product-direction assessment continue below, but the
+> side-effect recommendation is `no-action`, so the `gh` comment and label calls
+> will be skipped in execute mode.
 
 ## Language And Length
 

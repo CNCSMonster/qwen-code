@@ -15,20 +15,16 @@ that overview unless the user asks about the process itself.
 
 ## Inputs
 
-The default mode is **dry-run** (read-only analysis, no GitHub side effects).
-Use the `apply` prefix to enable posting comments and adding labels (with
-maintainer confirmation before each side effect).
+By default `/triage` analyzes the target, prints the staged report, and then
+posts the drafted comment and adds the planned labels in one pass. Add the
+`dry-run` prefix to print the staged report only — no GitHub side effects.
 
 Examples:
 
-- `/triage 4359` — dry-run analysis (default)
-- `/triage dry-run 4359` — explicit dry-run (same as bare number)
-- `/triage apply 4359` — apply mode, confirms before posting
-- `/triage apply https://github.com/QwenLM/qwen-code/pull/4359`
-- `/triage https://github.com/QwenLM/qwen-code/issues/4200` — dry-run
-- `/triage batch-issues` — dry-run batch
-- `/triage apply batch-issues` — apply batch with per-issue confirmation
-- `/triage labels-only 4200` — label plan only, no follow-up comment
+- `/triage 4359` — analyze and post.
+- `/triage https://github.com/QwenLM/qwen-code/pull/4359` — analyze and post.
+- `/triage dry-run 4359` — analyze only, no GitHub side effects.
+- `/triage dry-run https://github.com/QwenLM/qwen-code/issues/4200`
 
 ## Core Rules
 
@@ -39,17 +35,20 @@ Examples:
   remove labels.
 - Only add labels that already exist. Run `gh label list --repo QwenLM/qwen-code
 --limit 300` before proposing labels.
-- Always show the draft comment and label plan before posting or editing GitHub.
-- Default to dry-run unless the input explicitly includes `apply`. Dry-run may
-  read GitHub data but must not edit labels or post comments. The `apply` mode
-  still requires maintainer confirmation before each side effect.
-- If the user asked for review-only or labels-only, do not post comments.
+- Always print the staged report before any side effect, so the maintainer can
+  see exactly what was posted and labeled.
+- In `dry-run` mode, never call `gh issue comment`, `gh issue edit`, `gh pr
+comment`, or `gh pr edit`. Only read.
+- Honor the prior-handling gate: when the target is closed, assigned, has a
+  substantive maintainer/bot response, or already carries a triage marker, skip
+  the `gh` side-effect calls and output the staged report only.
 - Keep label triage and follow-up comments as separate decisions.
 
 ## Step 0: Resolve Target
 
-Parse mode from the input: if the first token is `apply`, `dry-run`, or
-`labels-only`, consume it as the mode flag. The remaining tokens are the target.
+Parse mode from the input: if the first token is `dry-run`, consume it as the
+mode flag. The remaining tokens are the target. Otherwise the input is the
+target and the mode is `execute` (the default).
 
 If the target is a PR URL (`/pull/`), route to **PR Intake**. If it is an issue
 URL (`/issues/`), route to **Issue Triage**.
@@ -69,26 +68,24 @@ fi
 
 If neither exists, report the error and stop. Do not guess.
 
-If the target is `batch-issues`, process at most five open candidate issues and
-pause for maintainer confirmation between issues.
-
 ## Gate Model
 
 Use three broad natural-language gates. Do not split every criterion into a
 separate gate; each gate should consider all relevant signals together and then
 decide whether to stop, continue, or hand off.
 
-| Gate          | Purpose                                                         | Checks                                                                                                                                  |
-| ------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| Context Gate  | Establish what can safely be evaluated                          | dry-run/apply mode, target type, repo safety, current labels, prior handling, markers, assignments, existing maintainer or bot comments |
-| Judgment Gate | Decide whether the item is well-formed and directionally useful | PR template/evidence/product/scope/history, or issue type/completeness/labels/related/product direction/bug evidence                    |
-| Route Gate    | Choose the next action without overreaching                     | no-action, need-information, need-retesting, related, welcome-pr, bugfix handoff, maintainer discussion, or code-review handoff         |
+| Gate          | Purpose                                                         | Checks                                                                                                                                         |
+| ------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Context Gate  | Establish what can safely be evaluated                          | mode (dry-run vs execute), target type, repo safety, current labels, prior handling, markers, assignments, existing maintainer or bot comments |
+| Judgment Gate | Decide whether the item is well-formed and directionally useful | PR template/evidence/product/scope/history, or issue type/completeness/labels/related/product direction/bug evidence                           |
+| Route Gate    | Choose the next action without overreaching                     | no-action, need-information, need-retesting, related, welcome-pr, bugfix handoff, maintainer discussion, or code-review handoff                |
 
 The gates are progressive and strictly sequential:
 
 - Each gate depends on the output of the previous gate. Do not skip ahead.
-- If Context blocks side effects, still complete dry-run analysis but recommend
-  `no-action` unless the user asks for override.
+- If Context blocks side effects, still complete the staged report but mark
+  the side-effect recommendation as `no-action`. In execute mode this is the
+  signal to skip the `gh` calls.
 - If Judgment finds missing PR evidence or missing issue facts, stop there and
   ask for the smallest useful clarification.
 - Only route to code review or bugfix after intake/triage has enough evidence
@@ -115,12 +112,12 @@ Evaluate route conditions in this order. Stop at the first match:
 7. **code-review** — PR intake passes all four dimensions, hand off to review.
 8. **no-action** — labels only, no comment needed.
 
-## Dry-Run Report
+## Staged Report
 
-For dry-run output, produce a staged report rather than only a label list. The
-stages are report sections, not micro-gates; they should summarize the three
-broad gates above. This is the main format for local evaluation with real
-PRs/issues.
+Every run produces a staged report rather than only a label list. The stages
+are report sections, not micro-gates; they should summarize the three broad
+gates above. In `dry-run` this is the entire output. In execute mode the
+report is printed first, then the `gh` side-effect calls run.
 
 Use these stages for issues:
 
@@ -152,13 +149,14 @@ Use these stages for PRs:
 `code-review` means hand off to the normal code review workflow or CI review. Do
 not perform deep code review inside this skill.
 
-Prior handling markers and existing substantive comments do not stop dry-run
-analysis. They only prevent recommending new GitHub side effects unless the user
-explicitly asks for manual override.
+Prior handling markers and existing substantive comments do not stop analysis.
+In dry-run, they only affect the recommendation in Stage 4. In execute mode,
+they cause the `gh` side-effect calls to be skipped, but the staged report is
+still printed.
 
 ## Public Comment Distillation
 
-Dry-run reports are for maintainers. GitHub comments are for authors and
+Staged reports are for maintainers. GitHub comments are for authors and
 reporters. Do not post the staged report, verdict table, label plan, route name,
 or internal reasoning directly as a public comment.
 
@@ -236,6 +234,22 @@ body for `Closes #N`, `Fixes #N`, `Resolves #N`, or related issue references;
 the current `gh pr view --json` output does not expose a
 `closingIssuesReferences` field.
 
+Before posting or labeling, run the prior-handling gate. Skip the `gh`
+side-effect calls (but still produce the staged report) when:
+
+- The PR is closed or merged.
+- It already has a `<!-- qwen-maintain:pr-intake -->` marker comment from a
+  prior triage run.
+- A maintainer or reviewer left a substantive review (`reviewDecision` is
+  `CHANGES_REQUESTED` or `APPROVED`, or a `COMMENTED` review with concrete
+  feedback).
+
+Prior handling never stops analysis. Continue with P-2 through P-4 and produce
+the full staged report. In Stage 4, set the side-effect recommendation to
+`no-action` and explain why; in execute mode this is the signal to skip the
+`gh` calls. If the maintainer wants to override, they can copy the `gh`
+commands from the staged report and run them manually.
+
 ### P-2: Load Rules
 
 Read from this skill's base directory:
@@ -295,17 +309,12 @@ Use a table only when it makes two or more requested changes easier to scan. Do
 not include a label plan in the public comment by default; show labels to the
 maintainer separately.
 
-Do not publish until the maintainer confirms.
+### P-5: Execute
 
-### P-5: Apply With Confirmation
+If mode is `dry-run`, or the prior-handling gate from P-1 blocks side effects,
+stop after printing the staged report.
 
-Show:
-
-- The draft PR intake comment.
-- Labels to add, if any.
-- Why no comment or labels are needed, if the PR is already ready for review.
-
-Only after confirmation:
+Otherwise run:
 
 ```bash
 gh pr comment <number> --repo QwenLM/qwen-code --body-file - <<'EOF'
@@ -314,6 +323,10 @@ EOF
 
 gh pr edit <number> --repo QwenLM/qwen-code --add-label "<label1>,<label2>"
 ```
+
+Use `--body-file -` with a heredoc so multi-line marker comments render
+correctly. Do not pass a literal `\n` sequence in `--body`; GitHub will render
+that as a collapsed single-line comment.
 
 ## Issue Triage
 
@@ -324,8 +337,8 @@ gh issue view <number> --repo QwenLM/qwen-code \
   --json number,title,body,state,labels,assignees,comments,author,createdAt,url
 ```
 
-Before applying GitHub side effects, run the prior-handling gate and skip or ask
-for explicit manual override when:
+Before posting or labeling, run the prior-handling gate. Skip the `gh`
+side-effect calls (but still produce the staged report) when:
 
 - The issue is closed, is a pull request, or is assigned to someone.
 - A collaborator/member/owner or the Qwen bot already provided substantive
@@ -339,10 +352,12 @@ for explicit manual override when:
   - `<!-- qwen-maintain:welcome-pr -->`
   - `<!-- qwen-maintain:pr-intake -->`
 
-In dry-run mode, prior handling does not stop analysis. Continue after recording
-the prior-handling reason, then output label sanity, product direction or
-diagnosis, and route. Set the side-effect recommendation to `no-action` unless
-the user requested override.
+Prior handling never stops analysis. Continue after recording the
+prior-handling reason, then output label sanity, product direction or
+diagnosis, and route. In Stage 4, set the side-effect recommendation to
+`no-action` and explain why; in execute mode this is the signal to skip the
+`gh` calls. If the maintainer wants to override, they can copy the `gh`
+commands from the staged report and run them manually.
 
 ### I-2: Load Rules
 
@@ -359,8 +374,6 @@ Always produce two separate plans:
 | -------------- | -------------------------------- | ----------------------------------------------------------------------------------- |
 | Label Plan     | Route the issue                  | Add existing `type/*`, `category/*`, `scope/*`, `priority/*`, and `status/*` labels |
 | Follow-up Plan | Help the reporter or contributor | Draft one conservative comment, or say no comment needed                            |
-
-If the user requested `labels-only`, stop after the Label Plan.
 
 For feature requests and enhancements, include a product direction assessment:
 
@@ -426,21 +439,18 @@ bot also recognizes it:
 Include the relevant file, likely cause, suggested fix direction, reproduction
 command, and test command.
 
-The markers are part of the public comment draft. Do not omit them from dry-run
-drafts, because maintainers need to see exactly what would be posted.
+The markers are part of the public comment draft. Always include them in the
+staged report, because the report should show exactly what would be posted.
 
-### I-6: Apply With Confirmation
+### I-6: Execute
 
 Before drafting the final comment, load `references/tone-guide.md` and verify
 all proposed labels exist via `gh label list --repo QwenLM/qwen-code --limit 300`.
 
-Show:
+If mode is `dry-run`, or the prior-handling gate from I-1 blocks side effects,
+stop after printing the staged report.
 
-- Labels to add.
-- Comment draft, if any.
-- Why no comment is needed, if no follow-up is recommended.
-
-Only after confirmation:
+Otherwise run:
 
 ```bash
 gh issue edit <number> --repo QwenLM/qwen-code --add-label "<label1>,<label2>"
@@ -454,32 +464,20 @@ Use `--body-file -` with a heredoc for multi-line marker comments. Do not pass a
 literal `\n` sequence in `--body`; GitHub will render that as a collapsed
 single-line comment.
 
-## Batch Issues
-
-Find candidates conservatively:
-
-```bash
-gh issue list --repo QwenLM/qwen-code --state open \
-  --label "status/needs-triage" --limit 5 \
-  --json number,title,createdAt,labels,assignees
-```
-
-For each candidate, run Issue Triage from I-1 through I-6. Do not process more
-than five issues in one batch unless the user explicitly asks.
-
 ## Common Mistakes
 
 - Calling this as `/qc maintain`; the skill command is `/triage`.
 - Reading `.qwen/skills/maintain/...`; references live under this skill's
   `references/` directory.
 - Treating missing author validation as something you can fix by running tests.
-- Posting a follow-up comment during a labels-only triage.
-- Treating prior-handling markers as a reason to omit dry-run product-direction
-  analysis.
+- Treating prior-handling markers as a reason to omit product-direction
+  analysis from the staged report.
 - Saying "duplicate" when the evidence only supports "related".
 - Suggesting labels before checking current repo labels.
-- Assuming bare `/triage <number>` is apply mode; it is always dry-run unless
-  `apply` is explicitly provided.
+- Forgetting that bare `/triage <number>` runs in execute mode; use `dry-run`
+  explicitly when you only want to inspect.
+- Skipping the staged report before posting; the maintainer needs to see what
+  was actually sent to GitHub.
 - Using only `qwen-maintain:welcome-pr` without `qwen-issue-bot:welcome-pr`;
   both markers are needed so the followup bot recognizes the comment.
 - Fetching the full diff for large PRs; use `--name-only` first, then
