@@ -5,9 +5,11 @@ description: Use when Qwen Code maintainers need to triage a GitHub PR or issue 
 
 # Triage
 
-Manual maintainer workflow for Qwen Code PR intake and issue triage. This skill
-drafts high-signal, warm, actionable maintainer guidance while keeping GitHub
-side effects explicit and reviewable.
+Automated workflow for Qwen Code PR intake and issue triage. Designed to run
+unattended in CI or interactively via `/triage`. Drafts high-signal, warm,
+actionable guidance while keeping GitHub side effects gated and auditable —
+no human confirmation is needed at runtime; the tiered gate model decides what
+to execute.
 
 For maintaining or extending this skill, read
 `references/workflow-overview.md` first. Normal triage runs do not need to load
@@ -35,13 +37,15 @@ Examples:
   remove labels.
 - Only add labels that already exist. Run `gh label list --repo QwenLM/qwen-code
 --limit 300` before proposing labels.
-- Always print the staged report before any side effect, so the maintainer can
-  see exactly what was posted and labeled.
+- Always print the staged report before any side effect as an audit trail of
+  what was analyzed, decided, and executed.
 - In `dry-run` mode, never call `gh issue comment`, `gh issue edit`, `gh pr
 comment`, or `gh pr edit`. Only read.
-- Honor the prior-handling gate: when the target is closed, assigned, has a
-  substantive maintainer/bot response, or already carries a triage marker, skip
-  the `gh` side-effect calls and output the staged report only.
+- Honor the tiered prior-handling gate. The **comment gate** blocks
+  `gh comment` calls when a collaborator already engaged or a marker exists.
+  The **label gate** blocks `gh edit --add-label` calls only when routing
+  labels already exist or the issue is closed. Both gates produce the full
+  staged report regardless.
 - Keep label triage and follow-up comments as separate decisions.
 
 ## Step 0: Resolve Target
@@ -74,18 +78,23 @@ Use three broad natural-language gates. Do not split every criterion into a
 separate gate; each gate should consider all relevant signals together and then
 decide whether to stop, continue, or hand off.
 
-| Gate          | Purpose                                                         | Checks                                                                                                                                         |
-| ------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| Context Gate  | Establish what can safely be evaluated                          | mode (dry-run vs execute), target type, repo safety, current labels, prior handling, markers, assignments, existing maintainer or bot comments |
-| Judgment Gate | Decide whether the item is well-formed and directionally useful | PR template/evidence/product/scope/history, or issue type/completeness/labels/related/product direction/bug evidence                           |
-| Route Gate    | Choose the next action without overreaching                     | no-action, need-information, need-retesting, related, welcome-pr, bugfix handoff, maintainer discussion, or code-review handoff                |
+| Gate          | Purpose                                                                   | Checks                                                                                                                                                                                                                                               |
+| ------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Context Gate  | Establish what can safely be evaluated and which side effects are allowed | mode (dry-run vs execute), target type, repo safety, current labels, prior handling, markers, assignments, existing maintainer or bot comments. Produces two independent decisions: **comment gate** (block/allow) and **label gate** (block/allow). |
+| Judgment Gate | Decide whether the item is well-formed and directionally useful           | PR template/evidence/product/scope/history, or issue type/completeness/labels/related/product direction/bug evidence                                                                                                                                 |
+| Route Gate    | Choose the next action without overreaching                               | no-action, need-information, need-retesting, related, welcome-pr, bugfix handoff, maintainer discussion, or code-review handoff                                                                                                                      |
 
 The gates are progressive and strictly sequential:
 
 - Each gate depends on the output of the previous gate. Do not skip ahead.
-- If Context blocks side effects, still complete the staged report but mark
-  the side-effect recommendation as `no-action`. In execute mode this is the
-  signal to skip the `gh` calls.
+- The Context Gate produces two independent blocking decisions:
+  - **Comment gate** — blocks `gh comment` when a collaborator/bot already
+    engaged, a marker exists, or the issue is closed/assigned/blocked.
+  - **Label gate** — blocks `gh edit --add-label` only when routing labels
+    already exist (`category/*` AND `priority/*` both present) or the issue
+    is closed. A collaborator comment alone does NOT block label additions.
+- If both gates block, mark the side-effect recommendation as `no-action`.
+  If only the comment gate blocks, labels can still proceed.
 - If Judgment finds missing PR evidence or missing issue facts, stop there and
   ask for the smallest useful clarification.
 - Only route to code review or bugfix after intake/triage has enough evidence
@@ -122,7 +131,8 @@ report is printed first, then the `gh` side-effect calls run.
 Use these stages for issues:
 
 1. **Stage 1: Intake Gate** — target state, prior handling markers, existing
-   maintainer or bot follow-up, and whether GitHub side effects are blocked.
+   maintainer or bot follow-up, and the tiered gate decisions (comment
+   blocked/allowed, labels blocked/allowed).
 2. **Stage 2: Labels & Information** — current labels, proposed label changes,
    missing information, version staleness, and related/duplicate status.
 3. **Stage 3: Product Direction Or Diagnosis** — for feature requests, judge
@@ -131,21 +141,28 @@ Use these stages for issues:
    likely diagnosis path.
 4. **Stage 4: Route & Side Effects** — next route (`no-action`,
    `need-information`, `need-retesting`, `related`, `welcome-pr`, `bugfix`,
-   `maintainer-discussion`, or `code-review`) plus whether a comment or label
-   edit is recommended.
+   `maintainer-discussion`, or `code-review`) plus per-tier side-effect status:
+
+   ```
+   Side effects:
+     Comment: ❌ BLOCKED — <reason> / ✅ ALLOWED
+     Labels:  ❌ BLOCKED — <reason> / ✅ ALLOWED — <reason>
+   ```
 
 Use these stages for PRs:
 
 1. **Stage 1: Intake Gate** — PR state, draft status, review activity summary
    (list reviewers, their states, and date of last review), author evidence
-   locations, and whether side effects are blocked by prior handling.
+   locations, and tiered gate decisions (comment blocked/allowed, labels
+   blocked/allowed).
 2. **Stage 2: Template & Evidence** — body completeness, author validation, and
    any intake stop condition.
 3. **Stage 3: Product Direction & Scope** — product fit, historical design
    context, size/scope, and split recommendation.
 4. **Stage 4: Route & Side Effects** — next route (`need-information`,
    `maintainer-discussion`, `suggest-split`, `code-review`, or `no-action`) plus
-   draft comment and label plan. When route is `no-action` due to prior review
+   per-tier side-effect status, draft comment (if comment gate allows), and label
+   plan (if label gate allows). When route is `no-action` due to prior review
    activity, explain what was found and why no comment is needed.
 
 `code-review` means hand off to the normal code review workflow or CI review. Do
@@ -153,8 +170,9 @@ not perform deep code review inside this skill.
 
 Prior handling markers and existing substantive comments do not stop analysis.
 In dry-run, they only affect the recommendation in Stage 4. In execute mode,
-they cause the `gh` side-effect calls to be skipped, but the staged report is
-still printed.
+the comment gate and label gate are evaluated independently: the comment gate
+may block `gh comment` while the label gate still allows `gh edit --add-label`.
+The staged report is always printed regardless of gate outcomes.
 
 ## Public Comment Distillation
 
@@ -250,8 +268,9 @@ body for `Closes #N`, `Fixes #N`, `Resolves #N`, or related issue references;
 the current `gh pr view --json` output does not expose a
 `closingIssuesReferences` field.
 
-Before posting or labeling, run the prior-handling gate. Skip the `gh`
-side-effect calls (but still produce the staged report) when:
+Before posting or labeling, run the tiered prior-handling gate.
+
+**Comment gate** — skip `gh pr comment` when any of these are true:
 
 - The PR is closed or merged.
 - It already has a `<!-- qwen-maintain:pr-intake -->` marker comment from a
@@ -265,11 +284,19 @@ side-effect calls (but still produce the staged report) when:
   back-and-forth review threads between reviewer and author indicate active
   review, not a fresh PR awaiting intake).
 
+**Label gate** — skip `gh pr edit --add-label` only when:
+
+- The PR is closed or merged.
+- Routing labels already exist (has at least `status/*` AND `type/*`).
+- A `<!-- qwen-maintain:pr-intake -->` marker exists (indicates full intake
+  was already done, labels included).
+
+Allow label additions when the comment gate is triggered (due to review
+activity) but no routing labels were applied yet.
+
 Prior handling never stops analysis. Continue with P-2 through P-4 and produce
-the full staged report. In Stage 4, set the side-effect recommendation to
-`no-action` and explain why; in execute mode this is the signal to skip the
-`gh` calls. If the maintainer wants to override, they can copy the `gh`
-commands from the staged report and run them manually.
+the full staged report. In Stage 4, show per-tier status. In execute mode,
+skip only the calls blocked by their respective gate.
 
 ### P-2: Load Rules
 
@@ -311,13 +338,15 @@ Soft-blocking triggers:
 Before drafting, load `references/tone-guide.md` and verify all proposed labels
 exist via `gh label list --repo QwenLM/qwen-code --limit 300`.
 
-**When prior-handling gate blocks side effects** (review activity already exists):
-skip drafting a public comment entirely. Only produce the staged report for the
-maintainer, noting that side effects are blocked and why. The staged report
+**When the comment gate blocks** (review activity already exists): skip
+drafting a public comment entirely. Only produce the staged report for the
+maintainer, noting that the comment gate is blocked and why. The staged report
 should still include the full analysis (product fit, body completeness, scope,
-validation) so the maintainer can act on it manually if desired. Labels-only
-edits are acceptable even when comments are blocked, if adding category or scope
-labels provides routing value and no labels were previously applied.
+validation) so the maintainer can act on it manually if desired.
+
+**When the label gate allows** (even if comment gate blocks): proceed with
+`gh pr edit --add-label` for routing labels that provide net-new value.
+Typical: adding `category/*`, `type/*`, or `status/in-review` when none exist.
 
 **When no prior handling exists** (fresh PR with no review activity): draft one
 PR comment starting with:
@@ -341,18 +370,21 @@ maintainer separately.
 
 ### P-5: Execute
 
-If mode is `dry-run`, or the prior-handling gate from P-1 blocks side effects,
-stop after printing the staged report.
+If mode is `dry-run`, stop after printing the staged report.
 
-Otherwise run:
+Otherwise, execute each action independently based on its gate:
 
-```bash
-gh pr comment <number> --repo QwenLM/qwen-code --body-file - <<'EOF'
-<comment with real newlines>
-EOF
-
-gh pr edit <number> --repo QwenLM/qwen-code --add-label "<label1>,<label2>"
-```
+- **Comment**: if the comment gate allows, run:
+  ```bash
+  gh pr comment <number> --repo QwenLM/qwen-code --body-file - <<'EOF'
+  <comment with real newlines>
+  EOF
+  ```
+- **Labels**: if the label gate allows, run:
+  ```bash
+  gh pr edit <number> --repo QwenLM/qwen-code --add-label "<label1>,<label2>"
+  ```
+- If both gates block, skip all `gh` calls.
 
 Use `--body-file -` with a heredoc so multi-line marker comments render
 correctly. Do not pass a literal `\n` sequence in `--body`; GitHub will render
@@ -367,8 +399,9 @@ gh issue view <number> --repo QwenLM/qwen-code \
   --json number,title,body,state,labels,assignees,comments,author,createdAt,url
 ```
 
-Before posting or labeling, run the prior-handling gate. Skip the `gh`
-side-effect calls (but still produce the staged report) when:
+Before posting or labeling, run the tiered prior-handling gate.
+
+**Comment gate** — skip `gh issue comment` when any of these are true:
 
 - The issue is closed, is a pull request, or is assigned to someone.
 - A collaborator/member/owner or the Qwen bot already provided substantive
@@ -382,12 +415,21 @@ side-effect calls (but still produce the staged report) when:
   - `<!-- qwen-maintain:welcome-pr -->`
   - `<!-- qwen-maintain:pr-intake -->`
 
+**Label gate** — skip `gh issue edit --add-label` only when:
+
+- The issue is closed.
+- Routing labels already present (has at least one `category/*` AND at least
+  one `priority/*`).
+- A triage marker comment exists (any `qwen-issue-bot:*` or
+  `qwen-maintain:*` marker, indicating full triage was already done).
+
+Allow label additions when the comment gate is triggered (due to a
+collaborator comment) but no routing labels were applied yet.
+
 Prior handling never stops analysis. Continue after recording the
 prior-handling reason, then output label sanity, product direction or
-diagnosis, and route. In Stage 4, set the side-effect recommendation to
-`no-action` and explain why; in execute mode this is the signal to skip the
-`gh` calls. If the maintainer wants to override, they can copy the `gh`
-commands from the staged report and run them manually.
+diagnosis, and route. In Stage 4, show per-tier side-effect status. In execute
+mode, skip only the calls blocked by their respective gate.
 
 ### I-2: Load Rules
 
@@ -477,18 +519,22 @@ staged report, because the report should show exactly what would be posted.
 Before drafting the final comment, load `references/tone-guide.md` and verify
 all proposed labels exist via `gh label list --repo QwenLM/qwen-code --limit 300`.
 
-If mode is `dry-run`, or the prior-handling gate from I-1 blocks side effects,
-stop after printing the staged report.
+If mode is `dry-run`, stop after printing the staged report.
 
-Otherwise run:
+Otherwise, execute each action independently based on its gate — no
+confirmation needed:
 
-```bash
-gh issue edit <number> --repo QwenLM/qwen-code --add-label "<label1>,<label2>"
-
-gh issue comment <number> --repo QwenLM/qwen-code --body-file - <<'EOF'
-<comment with real newlines>
-EOF
-```
+- **Labels**: if the label gate allows, run:
+  ```bash
+  gh issue edit <number> --repo QwenLM/qwen-code --add-label "<label1>,<label2>"
+  ```
+- **Comment**: if the comment gate allows, run:
+  ```bash
+  gh issue comment <number> --repo QwenLM/qwen-code --body-file - <<'EOF'
+  <comment with real newlines>
+  EOF
+  ```
+- If both gates block, skip all `gh` calls.
 
 Use `--body-file -` with a heredoc for multi-line marker comments. Do not pass a
 literal `\n` sequence in `--body`; GitHub will render that as a collapsed

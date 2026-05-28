@@ -55,9 +55,14 @@ flowchart TD
   IS --> RPT
   RPT --> MODE{"Mode?"}
   MODE -->|dry-run| END1["Stop"]
-  MODE -->|execute| PRIOR{"Prior handling<br/>blocked?"}
-  PRIOR -->|yes| END2["Skip gh calls, stop"]
-  PRIOR -->|no| GH["Run gh comment + label calls"]
+  MODE -->|execute| CG{"Comment gate?"}
+  CG -->|allowed| GH_COMMENT["Run gh comment"]
+  CG -->|blocked| SKIP_COMMENT["Skip comment"]
+  GH_COMMENT --> LG{"Label gate?"}
+  SKIP_COMMENT --> LG
+  LG -->|allowed| GH_LABEL["Run gh edit --add-label"]
+  LG -->|blocked| END2["Done"]
+  GH_LABEL --> END2
 ```
 
 ## Marker Coordination

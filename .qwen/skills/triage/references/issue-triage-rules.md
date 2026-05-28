@@ -250,25 +250,42 @@ For PR-only actions that the issue followup bot does not handle:
 
 - `<!-- qwen-maintain:pr-intake -->`
 
-## Prior Handling And Side Effects
+## Prior Handling — Comment Gate
 
-Prior handling blocks duplicate GitHub side effects; it never blocks analysis.
-Continue classifying, checking labels, and judging product direction or
-diagnosis, and produce the full staged report.
-
-Skip the `gh issue edit` and `gh issue comment` calls (but still print the
-staged report) when any of these are true:
+The comment gate blocks `gh issue comment` to prevent duplicate or noisy
+follow-ups. Skip commenting when any of these are true:
 
 - Closed issue.
 - Pull request.
 - Assigned issue.
 - Existing collaborator/member/owner substantive response.
 - Existing Qwen bot follow-up.
-- Existing marker comment.
+- Existing marker comment (`qwen-issue-bot:*` or `qwen-maintain:*`).
 - `status/in-progress` or `status/blocked`.
 
-If the maintainer wants to override, they can copy the `gh` commands from the
-staged report and run them manually.
+## Prior Handling — Label Gate
+
+The label gate blocks `gh issue edit --add-label` only when labels would be
+redundant or the issue is terminal. Skip label additions only when:
+
+- Closed issue.
+- Routing labels already present (issue has at least one `category/*` AND at
+  least one `priority/*`).
+- A triage marker comment exists (any `qwen-issue-bot:*` or `qwen-maintain:*`
+  marker, indicating full triage including labels was already done).
+
+Allow label additions when:
+
+- The comment gate is triggered but no routing labels exist yet.
+- Proposed labels are additive and provide net-new routing signal.
+- The existing collaborator comment was informational (e.g., linking a related
+  issue) rather than a full triage action with labels.
+
+## Analysis Never Blocked
+
+Both gates affect only `gh` calls. Continue classifying, checking labels, and
+judging product direction or diagnosis, and produce the full staged report
+regardless of gate outcomes.
 
 ## Label Rules
 
