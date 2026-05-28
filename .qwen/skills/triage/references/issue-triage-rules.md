@@ -252,16 +252,25 @@ For PR-only actions that the issue followup bot does not handle:
 
 ## Prior Handling — Comment Gate
 
-The comment gate blocks `gh issue comment` to prevent duplicate or noisy
-follow-ups. Skip commenting when any of these are true:
+The comment gate has three outcomes: `create`, `update`, or `skip`.
+
+**`skip`** — no comment action. Applies when:
 
 - Closed issue.
 - Pull request.
 - Assigned issue.
-- Existing collaborator/member/owner substantive response.
-- Existing Qwen bot follow-up.
-- Existing marker comment (`qwen-issue-bot:*` or `qwen-maintain:*`).
+- Existing collaborator/member/owner substantive response (without our marker).
+- Existing Qwen bot follow-up (without our marker).
 - `status/in-progress` or `status/blocked`.
+
+**`update`** — patch the existing marker comment in place. Applies when:
+
+- Our own marker comment (`qwen-issue-bot:*` or `qwen-maintain:*`) already
+  exists AND the issue is still open.
+- Find the comment ID via `gh api` and PATCH it with updated content.
+- This prevents stale triage comments while avoiding duplicate noise.
+
+**`create`** — post a new comment. Default when none of the above apply.
 
 ## Prior Handling — Label Gate
 

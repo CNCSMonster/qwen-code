@@ -56,9 +56,11 @@ flowchart TD
   RPT --> MODE{"Mode?"}
   MODE -->|dry-run| END1["Stop"]
   MODE -->|execute| CG{"Comment gate?"}
-  CG -->|allowed| GH_COMMENT["Run gh comment"]
-  CG -->|blocked| SKIP_COMMENT["Skip comment"]
+  CG -->|create| GH_COMMENT["Post new comment"]
+  CG -->|update| GH_UPDATE["Patch existing comment"]
+  CG -->|skip| SKIP_COMMENT["Skip comment"]
   GH_COMMENT --> LG{"Label gate?"}
+  GH_UPDATE --> LG
   SKIP_COMMENT --> LG
   LG -->|allowed| GH_LABEL["Run gh edit --add-label"]
   LG -->|blocked| END2["Done"]

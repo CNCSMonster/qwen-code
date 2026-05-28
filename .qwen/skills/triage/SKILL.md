@@ -41,11 +41,12 @@ Examples:
   what was analyzed, decided, and executed.
 - In `dry-run` mode, never call `gh issue comment`, `gh issue edit`, `gh pr
 comment`, or `gh pr edit`. Only read.
-- Honor the tiered prior-handling gate. The **comment gate** blocks
-  `gh comment` calls when a collaborator already engaged or a marker exists.
-  The **label gate** blocks `gh edit --add-label` calls only when routing
-  labels already exist or the issue is closed. Both gates produce the full
-  staged report regardless.
+- Honor the tiered prior-handling gate. The **comment gate** decides
+  `create`, `update`, or `skip`: it updates in place when our own marker
+  comment exists, skips when a collaborator engaged independently or the
+  target is closed, and creates otherwise. The **label gate** blocks
+  `gh edit --add-label` only when routing labels already exist or the issue
+  is closed. Both gates produce the full staged report regardless.
 - Keep label triage and follow-up comments as separate decisions.
 
 ## Step 0: Resolve Target
@@ -88,13 +89,18 @@ The gates are progressive and strictly sequential:
 
 - Each gate depends on the output of the previous gate. Do not skip ahead.
 - The Context Gate produces two independent blocking decisions:
-  - **Comment gate** — blocks `gh comment` when a collaborator/bot already
-    engaged, a marker exists, or the issue is closed/assigned/blocked.
+  - **Comment gate** — three outcomes:
+    - `create`: no prior marker, no collaborator engagement, target is open.
+    - `update`: our own marker comment already exists AND target is open.
+      Find the existing comment ID and PATCH it instead of posting a new one.
+    - `skip`: target is closed/assigned/blocked, OR a collaborator engaged
+      without our marker (avoid noise on someone else's thread).
   - **Label gate** — blocks `gh edit --add-label` only when routing labels
     already exist (`category/*` AND `priority/*` both present) or the issue
     is closed. A collaborator comment alone does NOT block label additions.
-- If both gates block, mark the side-effect recommendation as `no-action`.
-  If only the comment gate blocks, labels can still proceed.
+- If comment gate is `skip` and label gate blocks, mark the side-effect
+  recommendation as `no-action`. If only comment is `skip`, labels can still
+  proceed. If comment is `update`, both comment and labels proceed.
 - If Judgment finds missing PR evidence or missing issue facts, stop there and
   ask for the smallest useful clarification.
 - Only route to code review or bugfix after intake/triage has enough evidence
@@ -145,7 +151,7 @@ Use these stages for issues:
 
    ```
    Side effects:
-     Comment: ❌ BLOCKED — <reason> / ✅ ALLOWED
+     Comment: ⏭️ SKIP — <reason> / 🔄 UPDATE — <comment_id> / ✅ CREATE
      Labels:  ❌ BLOCKED — <reason> / ✅ ALLOWED — <reason>
    ```
 
@@ -270,19 +276,22 @@ the current `gh pr view --json` output does not expose a
 
 Before posting or labeling, run the tiered prior-handling gate.
 
-**Comment gate** — skip `gh pr comment` when any of these are true:
+**Comment gate** — evaluate in order:
 
-- The PR is closed or merged.
-- It already has a `<!-- qwen-maintain:pr-intake -->` marker comment from a
-  prior triage run.
-- A maintainer or reviewer left a substantive review. Check BOTH:
-  - `reviewDecision` is `CHANGES_REQUESTED` or `APPROVED`, OR
-  - The individual `reviews` list contains any `CHANGES_REQUESTED` or `APPROVED`
-    entries from non-bot users (even if `reviewDecision` has since reset to
-    `REVIEW_REQUIRED` after the author pushed fixes).
-- A maintainer or collaborator already engaged in review comments (multiple
-  back-and-forth review threads between reviewer and author indicate active
-  review, not a fresh PR awaiting intake).
+1. `skip` when:
+   - The PR is closed or merged.
+   - A maintainer or reviewer left a substantive review. Check BOTH:
+     - `reviewDecision` is `CHANGES_REQUESTED` or `APPROVED`, OR
+     - The individual `reviews` list contains any `CHANGES_REQUESTED` or
+       `APPROVED` entries from non-bot users (even if `reviewDecision` has
+       since reset to `REVIEW_REQUIRED` after the author pushed fixes).
+   - A maintainer or collaborator already engaged in review comments (multiple
+     back-and-forth review threads between reviewer and author indicate active
+     review, not a fresh PR awaiting intake).
+2. `update` when:
+   - A `<!-- qwen-maintain:pr-intake -->` marker comment from a prior triage
+     run exists AND the PR is still open. Find the comment ID and PATCH it.
+3. `create` — default when none of the above apply.
 
 **Label gate** — skip `gh pr edit --add-label` only when:
 
@@ -374,21 +383,32 @@ If mode is `dry-run`, stop after printing the staged report.
 
 Otherwise, execute each action independently based on its gate:
 
-- **Comment**: if the comment gate allows, run:
+- **Comment — `create`**: post a new comment:
   ```bash
   gh pr comment <number> --repo QwenLM/qwen-code --body-file - <<'EOF'
   <comment with real newlines>
   EOF
   ```
+- **Comment — `update`**: find the existing marker comment and patch it:
+  ```bash
+  COMMENT_ID=$(gh api repos/QwenLM/qwen-code/issues/<number>/comments \
+    --jq '.[] | select(.body | contains("<!-- qwen-maintain:pr-intake -->")) | .id' \
+    | head -1)
+  gh api repos/QwenLM/qwen-code/issues/comments/$COMMENT_ID \
+    --method PATCH --field body=@-  <<'EOF'
+  <updated comment with real newlines>
+  EOF
+  ```
+- **Comment — `skip`**: no comment action.
 - **Labels**: if the label gate allows, run:
   ```bash
   gh pr edit <number> --repo QwenLM/qwen-code --add-label "<label1>,<label2>"
   ```
-- If both gates block, skip all `gh` calls.
+- If comment is `skip` and label gate blocks, skip all `gh` calls.
 
-Use `--body-file -` with a heredoc so multi-line marker comments render
-correctly. Do not pass a literal `\n` sequence in `--body`; GitHub will render
-that as a collapsed single-line comment.
+Use `--body-file -` or `--field body=@-` with a heredoc so multi-line marker
+comments render correctly. Do not pass a literal `\n` sequence; GitHub will
+render that as a collapsed single-line comment.
 
 ## Issue Triage
 
@@ -401,19 +421,22 @@ gh issue view <number> --repo QwenLM/qwen-code \
 
 Before posting or labeling, run the tiered prior-handling gate.
 
-**Comment gate** — skip `gh issue comment` when any of these are true:
+**Comment gate** — evaluate in order:
 
-- The issue is closed, is a pull request, or is assigned to someone.
-- A collaborator/member/owner or the Qwen bot already provided substantive
-  follow-up.
-- It has `status/in-progress` or `status/blocked`.
-- It already has one of these marker comments:
-  - `<!-- qwen-issue-bot:invalid -->`
-  - `<!-- qwen-issue-bot:needs-info -->`
-  - `<!-- qwen-issue-bot:related -->`
-  - `<!-- qwen-issue-bot:welcome-pr -->`
-  - `<!-- qwen-maintain:welcome-pr -->`
-  - `<!-- qwen-maintain:pr-intake -->`
+1. `skip` when:
+   - The issue is closed, is a pull request, or is assigned to someone.
+   - A collaborator/member/owner or the Qwen bot already provided substantive
+     follow-up (without our marker — i.e., independent engagement).
+   - It has `status/in-progress` or `status/blocked`.
+2. `update` when:
+   - One of our marker comments already exists AND the issue is still open:
+     - `<!-- qwen-issue-bot:invalid -->`
+     - `<!-- qwen-issue-bot:needs-info -->`
+     - `<!-- qwen-issue-bot:related -->`
+     - `<!-- qwen-issue-bot:welcome-pr -->`
+     - `<!-- qwen-maintain:welcome-pr -->`
+   - Find the existing comment ID and PATCH it with updated content.
+3. `create` — default when none of the above apply.
 
 **Label gate** — skip `gh issue edit --add-label` only when:
 
@@ -528,17 +551,28 @@ confirmation needed:
   ```bash
   gh issue edit <number> --repo QwenLM/qwen-code --add-label "<label1>,<label2>"
   ```
-- **Comment**: if the comment gate allows, run:
+- **Comment — `create`**: post a new comment:
   ```bash
   gh issue comment <number> --repo QwenLM/qwen-code --body-file - <<'EOF'
   <comment with real newlines>
   EOF
   ```
-- If both gates block, skip all `gh` calls.
+- **Comment — `update`**: find the existing marker comment and patch it:
+  ```bash
+  COMMENT_ID=$(gh api repos/QwenLM/qwen-code/issues/<number>/comments \
+    --jq '.[] | select(.body | contains("<!-- qwen-issue-bot:")) | .id' \
+    | head -1)
+  gh api repos/QwenLM/qwen-code/issues/comments/$COMMENT_ID \
+    --method PATCH --field body=@- <<'EOF'
+  <updated comment with real newlines>
+  EOF
+  ```
+- **Comment — `skip`**: no comment action.
+- If comment is `skip` and label gate blocks, skip all `gh` calls.
 
-Use `--body-file -` with a heredoc for multi-line marker comments. Do not pass a
-literal `\n` sequence in `--body`; GitHub will render that as a collapsed
-single-line comment.
+Use `--body-file -` or `--field body=@-` with a heredoc for multi-line marker
+comments. Do not pass a literal `\n` sequence; GitHub will render that as a
+collapsed single-line comment.
 
 ## Common Mistakes
 
