@@ -136,15 +136,17 @@ Use these stages for issues:
 
 Use these stages for PRs:
 
-1. **Stage 1: Intake Gate** — PR state, draft status, author evidence locations,
-   and existing review/maintainer context.
+1. **Stage 1: Intake Gate** — PR state, draft status, review activity summary
+   (list reviewers, their states, and date of last review), author evidence
+   locations, and whether side effects are blocked by prior handling.
 2. **Stage 2: Template & Evidence** — body completeness, author validation, and
    any intake stop condition.
 3. **Stage 3: Product Direction & Scope** — product fit, historical design
    context, size/scope, and split recommendation.
 4. **Stage 4: Route & Side Effects** — next route (`need-information`,
    `maintainer-discussion`, `suggest-split`, `code-review`, or `no-action`) plus
-   draft comment and label plan.
+   draft comment and label plan. When route is `no-action` due to prior review
+   activity, explain what was found and why no comment is needed.
 
 `code-review` means hand off to the normal code review workflow or CI review. Do
 not perform deep code review inside this skill.
@@ -194,6 +196,7 @@ name. For example:
 ```bash
 gh pr view <number> --repo QwenLM/qwen-code \
   --json number,title,body,author,labels,files,additions,deletions,changedFiles,baseRefName,headRefName,state,isDraft,reviewDecision,url
+
 gh pr diff <number> --repo QwenLM/qwen-code --name-only
 
 gh pr view <number> --repo QwenLM/qwen-code --json comments --jq '
@@ -206,7 +209,20 @@ gh pr view <number> --repo QwenLM/qwen-code --json comments --jq '
       marker: (.body | match("<!--[^>]+-->")?.string),
       summary: (.body | split("\n") | map(select(length > 0)) | .[0:8] | join("\n"))
     }'
+
+gh pr view <number> --repo QwenLM/qwen-code --json reviews --jq '
+  .reviews[]
+  | {
+      author: .author.login,
+      state: .state,
+      submittedAt
+    }'
 ```
+
+The `reviews` query is critical: `reviewDecision` only reflects the current
+overall status and resets to `REVIEW_REQUIRED` after the author pushes new
+commits, even if maintainers previously left `CHANGES_REQUESTED` reviews. Always
+check the individual reviews list to detect prior review activity.
 
 When product direction assessment needs behavioral context beyond filenames (e.g.,
 the PR touches core agent, auth, model selection, sandbox, or telemetry), fetch
@@ -240,9 +256,14 @@ side-effect calls (but still produce the staged report) when:
 - The PR is closed or merged.
 - It already has a `<!-- qwen-maintain:pr-intake -->` marker comment from a
   prior triage run.
-- A maintainer or reviewer left a substantive review (`reviewDecision` is
-  `CHANGES_REQUESTED` or `APPROVED`, or a `COMMENTED` review with concrete
-  feedback).
+- A maintainer or reviewer left a substantive review. Check BOTH:
+  - `reviewDecision` is `CHANGES_REQUESTED` or `APPROVED`, OR
+  - The individual `reviews` list contains any `CHANGES_REQUESTED` or `APPROVED`
+    entries from non-bot users (even if `reviewDecision` has since reset to
+    `REVIEW_REQUIRED` after the author pushed fixes).
+- A maintainer or collaborator already engaged in review comments (multiple
+  back-and-forth review threads between reviewer and author indicate active
+  review, not a fresh PR awaiting intake).
 
 Prior handling never stops analysis. Continue with P-2 through P-4 and produce
 the full staged report. In Stage 4, set the side-effect recommendation to
@@ -290,7 +311,16 @@ Soft-blocking triggers:
 Before drafting, load `references/tone-guide.md` and verify all proposed labels
 exist via `gh label list --repo QwenLM/qwen-code --limit 300`.
 
-Draft one PR comment starting with:
+**When prior-handling gate blocks side effects** (review activity already exists):
+skip drafting a public comment entirely. Only produce the staged report for the
+maintainer, noting that side effects are blocked and why. The staged report
+should still include the full analysis (product fit, body completeness, scope,
+validation) so the maintainer can act on it manually if desired. Labels-only
+edits are acceptable even when comments are blocked, if adding category or scope
+labels provides routing value and no labels were previously applied.
+
+**When no prior handling exists** (fresh PR with no review activity): draft one
+PR comment starting with:
 
 ```markdown
 <!-- qwen-maintain:pr-intake -->
