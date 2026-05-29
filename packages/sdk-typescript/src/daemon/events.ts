@@ -101,6 +101,11 @@ const DAEMON_KNOWN_EVENT_TYPE_VALUES = [
   'user_shell_result',
   'turn_complete',
   'turn_error',
+  // A5 (#4511): synthetic side-channel snapshot yielded after
+  // `replay_complete` when `?snapshot=1` is set on the SSE endpoint.
+  // Carries `currentModelId` and `currentApprovalMode` so reconnecting
+  // clients can seed their reducer without an extra round-trip.
+  'session_snapshot',
 ] as const;
 
 const DAEMON_KNOWN_EVENT_TYPES: ReadonlySet<string> = new Set<string>(
@@ -639,6 +644,13 @@ export interface DaemonTurnErrorData {
   [key: string]: unknown;
 }
 
+export interface DaemonSessionSnapshotData {
+  sessionId: string;
+  currentModelId: string | null;
+  currentApprovalMode: string | null;
+  [key: string]: unknown;
+}
+
 export type DaemonSessionUpdateEvent = DaemonEventEnvelope<
   'session_update',
   DaemonSessionUpdateData
@@ -770,6 +782,10 @@ export type DaemonTurnErrorEvent = DaemonEventEnvelope<
   'turn_error',
   DaemonTurnErrorData
 >;
+export type DaemonSessionSnapshotEvent = DaemonEventEnvelope<
+  'session_snapshot',
+  DaemonSessionSnapshotData
+>;
 
 export type DaemonAuthEvent =
   | DaemonAuthDeviceFlowStartedEvent
@@ -845,7 +861,8 @@ export type KnownDaemonEvent =
   | DaemonWorkspaceMutationEvent
   | DaemonAuthEvent
   | DaemonAssistEvent
-  | DaemonTurnEvent;
+  | DaemonTurnEvent
+  | DaemonSessionSnapshotEvent;
 
 export interface DaemonSessionViewState {
   lastEventId?: number;
@@ -1300,6 +1317,10 @@ export function asKnownDaemonEvent(
       return isTurnErrorData(event.data)
         ? (event as DaemonTurnErrorEvent)
         : undefined;
+    case 'session_snapshot':
+      return isSessionSnapshotData(event.data)
+        ? (event as DaemonSessionSnapshotEvent)
+        : undefined;
     default:
       return undefined;
   }
@@ -1658,6 +1679,17 @@ export function reduceDaemonSessionEvent(
       return {
         ...base,
         lastTurnError: event.data,
+      };
+    case 'session_snapshot':
+      return {
+        ...base,
+        sessionId: event.data.sessionId,
+        ...(event.data.currentModelId != null
+          ? { currentModelId: event.data.currentModelId }
+          : {}),
+        ...(event.data.currentApprovalMode != null
+          ? { approvalMode: event.data.currentApprovalMode }
+          : {}),
       };
     default: {
       const _exhaustive: never = event;
@@ -2375,6 +2407,12 @@ function isTurnErrorData(value: unknown): value is DaemonTurnErrorData {
     isNonEmptyString(value['sessionId']) &&
     isNonEmptyString(value['message'])
   );
+}
+
+function isSessionSnapshotData(
+  value: unknown,
+): value is DaemonSessionSnapshotData {
+  return isRecord(value) && isNonEmptyString(value['sessionId']);
 }
 
 function isPermissionOption(value: unknown): value is DaemonPermissionOption {
