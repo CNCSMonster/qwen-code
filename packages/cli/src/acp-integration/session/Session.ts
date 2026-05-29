@@ -1691,7 +1691,19 @@ export class Session implements SessionContext {
       yolo: ApprovalMode.YOLO,
     };
 
+    // `modeId` arrives over the wire (ACP `session/set_mode`, or
+    // `setSessionConfigOption` casting an unknown `value` to string), so
+    // validate at this boundary. An unknown id would otherwise call
+    // `setApprovalMode(undefined)` — leaving the permission system in an
+    // undefined state — and the A2 broadcast below would fan the bogus id
+    // out to every attached SSE client.
     const approvalMode = modeMap[params.modeId as ApprovalModeValue];
+    if (approvalMode === undefined) {
+      throw RequestError.invalidParams(
+        undefined,
+        `Unknown approval mode: ${params.modeId}`,
+      );
+    }
     this.config.setApprovalMode(approvalMode);
 
     // A2 (#4511): notify attached clients of an in-session mode switch.
@@ -1702,7 +1714,10 @@ export class Session implements SessionContext {
         sessionId: this.sessionId,
         currentModeId: params.modeId,
       })
-      .catch(() => {});
+      .catch(() => {
+        // Advisory only; a failed notification must not fail the mode
+        // switch. Matches the model-update extNotification in `setModel`.
+      });
   }
 
   /**
@@ -1810,7 +1825,10 @@ export class Session implements SessionContext {
         sessionId: this.sessionId,
         currentModeId: newModeId,
       })
-      .catch(() => {});
+      .catch(() => {
+        // Advisory only; a failed notification must not fail the mode
+        // change. Matches the model-update extNotification in `setModel`.
+      });
   }
 
   /**
