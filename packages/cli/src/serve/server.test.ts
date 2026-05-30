@@ -37,6 +37,7 @@ import type {
 } from '@agentclientprotocol/sdk';
 import {
   ApprovalMode,
+  SessionService,
   Storage,
   TrustGateError,
 } from '@qwen-code/qwen-code-core';
@@ -140,6 +141,9 @@ const EXPECTED_STAGE1_FEATURES = [
   // MCP budget state crossings (`mcp_budget_warning` with hysteresis,
   // `mcp_child_refused_batch` coalesced per pass).
   'mcp_guardrail_events',
+  // T2.8 (#4514). Always-on. Daemon supports runtime MCP server
+  // mutation (add / remove) via POST/DELETE /workspace/mcp/servers.
+  'mcp_server_runtime_mutation',
   // Issue #4175 PR 19. Always-on. Daemon exposes the read-only file
   // surface: `GET /file`, `GET /list`, `GET /glob`, `GET /stat`.
   'workspace_file_read',
@@ -312,6 +316,33 @@ interface FakeBridgeOpts {
         reason: 'in_flight' | 'disabled' | 'budget_would_exceed';
       }
   >;
+  addRuntimeMcpServerImpl?: (
+    name: string,
+    config: Record<string, unknown>,
+    originatorClientId: string,
+  ) => Promise<
+    | {
+        name: string;
+        transport: string;
+        replaced: boolean;
+        shadowedSettings: boolean;
+        toolCount: number;
+        originatorClientId: string;
+      }
+    | { name: string; skipped: true; reason: 'budget_warning_only' }
+  >;
+  removeRuntimeMcpServerImpl?: (
+    name: string,
+    originatorClientId: string,
+  ) => Promise<
+    | {
+        name: string;
+        removed: true;
+        wasShadowingSettings: boolean;
+        originatorClientId: string;
+      }
+    | { name: string; skipped: true; reason: 'not_present' }
+  >;
   closeImpl?: (
     sessionId: string,
     context?: BridgeClientRequestContext,
@@ -399,6 +430,15 @@ interface FakeBridge extends HttpAcpBridge {
     serverName: string;
     originatorClientId?: string;
     opts?: { entryIndex?: number };
+  }>;
+  addRuntimeMcpServerCalls: Array<{
+    name: string;
+    config: Record<string, unknown>;
+    originatorClientId: string;
+  }>;
+  removeRuntimeMcpServerCalls: Array<{
+    name: string;
+    originatorClientId: string;
   }>;
   closeCalls: Array<{
     sessionId: string;
@@ -636,6 +676,31 @@ function fakeBridge(opts: FakeBridgeOpts = {}): FakeBridge {
       restarted: true as const,
       durationMs: 42,
     }));
+  const addRuntimeMcpServerCalls: FakeBridge['addRuntimeMcpServerCalls'] = [];
+  const addRuntimeMcpServerImpl =
+    opts.addRuntimeMcpServerImpl ??
+    (async (
+      name: string,
+      _config: Record<string, unknown>,
+      originatorClientId: string,
+    ) => ({
+      name,
+      transport: 'stdio' as const,
+      replaced: false,
+      shadowedSettings: false,
+      toolCount: 3,
+      originatorClientId,
+    }));
+  const removeRuntimeMcpServerCalls: FakeBridge['removeRuntimeMcpServerCalls'] =
+    [];
+  const removeRuntimeMcpServerImpl =
+    opts.removeRuntimeMcpServerImpl ??
+    (async (name: string, originatorClientId: string) => ({
+      name,
+      removed: true as const,
+      wasShadowingSettings: false,
+      originatorClientId,
+    }));
   const closeImpl = opts.closeImpl ?? (async () => {});
   const updateMetadataImpl =
     opts.updateMetadataImpl ??
@@ -684,6 +749,8 @@ function fakeBridge(opts: FakeBridgeOpts = {}): FakeBridge {
     setToolEnabledCalls,
     initWorkspaceCalls,
     restartMcpServerCalls,
+    addRuntimeMcpServerCalls,
+    removeRuntimeMcpServerCalls,
     closeCalls,
     updateMetadataCalls,
     heartbeatCalls,
@@ -870,6 +937,14 @@ function fakeBridge(opts: FakeBridgeOpts = {}): FakeBridge {
         ...(restartOpts !== undefined ? { opts: restartOpts } : {}),
       });
       return restartMcpServerImpl(serverName, originatorClientId, restartOpts);
+    },
+    async addRuntimeMcpServer(name, config, originatorClientId) {
+      addRuntimeMcpServerCalls.push({ name, config, originatorClientId });
+      return addRuntimeMcpServerImpl(name, config, originatorClientId);
+    },
+    async removeRuntimeMcpServer(name, originatorClientId) {
+      removeRuntimeMcpServerCalls.push({ name, originatorClientId });
+      return removeRuntimeMcpServerImpl(name, originatorClientId);
     },
     async closeSession(sessionId, context) {
       closeCalls.push({ sessionId, ...(context ? { context } : {}) });
@@ -1141,6 +1216,18 @@ describe('createServeApp', () => {
       expect(SERVE_CAPABILITY_REGISTRY['mcp_guardrail_events']).toEqual({
         since: 'v1',
       });
+    });
+
+    it('registers mcp_server_runtime_mutation as a baseline tag (T2.8 #4514)', () => {
+      // Always-on tag. SDK clients pre-flight
+      // `caps.features.includes('mcp_server_runtime_mutation')` before
+      // calling `POST /workspace/mcp/servers` — older daemons silently 404.
+      expect(SERVE_CAPABILITY_REGISTRY['mcp_server_runtime_mutation']).toEqual({
+        since: 'v1',
+      });
+      expect(getAdvertisedServeFeatures()).toContain(
+        'mcp_server_runtime_mutation',
+      );
     });
 
     it('returns protocol version metadata with a fresh supported array', () => {
@@ -3374,6 +3461,355 @@ describe('createServeApp', () => {
     });
   });
 
+  describe('POST /workspace/mcp/servers (T2.8 #4514)', () => {
+    const tokenOpts: ServeOptions = { ...baseOpts, token: 'secret' };
+    const auth = (req: request.Test): request.Test =>
+      req
+        .set('Host', `127.0.0.1:${tokenOpts.port}`)
+        .set('Authorization', 'Bearer secret');
+
+    it('200 fresh add returns structured result', async () => {
+      const bridge = fakeBridge({ knownClientIds: ['client-1'] });
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const res = await auth(request(app).post('/workspace/mcp/servers'))
+        .set('X-Qwen-Client-Id', 'client-1')
+        .send({ name: 'echo', config: { command: 'echo', args: ['hello'] } });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        name: 'echo',
+        transport: 'stdio',
+        replaced: false,
+        shadowedSettings: false,
+        toolCount: 3,
+        originatorClientId: 'client-1',
+      });
+      expect(bridge.addRuntimeMcpServerCalls).toHaveLength(1);
+      expect(bridge.addRuntimeMcpServerCalls[0]).toMatchObject({
+        name: 'echo',
+        config: { command: 'echo', args: ['hello'] },
+        originatorClientId: 'client-1',
+      });
+    });
+
+    it('200 soft refuse (skipped:true, reason:budget_warning_only)', async () => {
+      const bridge = fakeBridge({
+        knownClientIds: ['client-1'],
+        addRuntimeMcpServerImpl: async (name) => ({
+          name,
+          skipped: true as const,
+          reason: 'budget_warning_only' as const,
+        }),
+      });
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const res = await auth(request(app).post('/workspace/mcp/servers'))
+        .set('X-Qwen-Client-Id', 'client-1')
+        .send({ name: 'echo', config: { command: 'echo' } });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        name: 'echo',
+        skipped: true,
+        reason: 'budget_warning_only',
+      });
+    });
+
+    it('400 invalid_server_name when name is empty', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const res = await auth(request(app).post('/workspace/mcp/servers')).send({
+        name: '',
+        config: { command: 'echo' },
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('invalid_server_name');
+      expect(bridge.addRuntimeMcpServerCalls).toHaveLength(0);
+    });
+
+    it('400 invalid_server_name when name exceeds MAX_SERVER_NAME_LENGTH', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const overlong = 'a'.repeat(257);
+      const res = await auth(request(app).post('/workspace/mcp/servers')).send({
+        name: overlong,
+        config: { command: 'echo' },
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('invalid_server_name');
+      expect(bridge.addRuntimeMcpServerCalls).toHaveLength(0);
+    });
+
+    it('400 invalid_server_name when name contains illegal chars (slash)', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const res = await auth(request(app).post('/workspace/mcp/servers')).send({
+        name: 'foo/bar',
+        config: { command: 'echo' },
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('invalid_server_name');
+      expect(bridge.addRuntimeMcpServerCalls).toHaveLength(0);
+    });
+
+    it('400 invalid_server_name when name is a reserved JS property', async () => {
+      for (const name of ['__proto__', 'constructor', 'prototype']) {
+        const bridge = fakeBridge();
+        const app = createServeApp(tokenOpts, undefined, { bridge });
+        const res = await auth(
+          request(app).post('/workspace/mcp/servers'),
+        ).send({
+          name,
+          config: { command: 'echo' },
+        });
+        expect(res.status).toBe(400);
+        expect(res.body.code).toBe('invalid_server_name');
+        expect(res.body.error).toContain('reserved');
+        expect(bridge.addRuntimeMcpServerCalls).toHaveLength(0);
+      }
+    });
+
+    it('400 missing_required_field when config is absent', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const res = await auth(request(app).post('/workspace/mcp/servers')).send({
+        name: 'echo',
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('missing_required_field');
+      expect(res.body.field).toBe('config');
+      expect(bridge.addRuntimeMcpServerCalls).toHaveLength(0);
+    });
+
+    it('401 auth_required when no bearer token (strict gate)', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp(baseOpts, undefined, { bridge });
+      const res = await request(app)
+        .post('/workspace/mcp/servers')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .send({ name: 'echo', config: { command: 'echo' } });
+      expect(res.status).toBe(401);
+      expect(bridge.addRuntimeMcpServerCalls).toHaveLength(0);
+    });
+
+    it('400 invalid_client_id on unknown X-Qwen-Client-Id', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const res = await auth(request(app).post('/workspace/mcp/servers'))
+        .set('X-Qwen-Client-Id', 'forged-client')
+        .send({ name: 'echo', config: { command: 'echo' } });
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({
+        code: 'invalid_client_id',
+        clientId: 'forged-client',
+      });
+      expect(bridge.addRuntimeMcpServerCalls).toHaveLength(0);
+    });
+
+    it('409 mcp_budget_would_exceed when bridge throws with that errorKind', async () => {
+      const bridge = fakeBridge({
+        knownClientIds: ['client-1'],
+        addRuntimeMcpServerImpl: async () => {
+          throw Object.assign(new Error('Budget exceeded'), {
+            data: { errorKind: 'mcp_budget_would_exceed', serverName: 'echo' },
+          });
+        },
+      });
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const res = await auth(request(app).post('/workspace/mcp/servers'))
+        .set('X-Qwen-Client-Id', 'client-1')
+        .send({ name: 'echo', config: { command: 'echo' } });
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('mcp_budget_would_exceed');
+    });
+
+    it('502 mcp_server_spawn_failed with body details', async () => {
+      const bridge = fakeBridge({
+        knownClientIds: ['client-1'],
+        addRuntimeMcpServerImpl: async () => {
+          throw Object.assign(new Error('Spawn failed'), {
+            data: {
+              errorKind: 'mcp_server_spawn_failed',
+              serverName: 'broken',
+              exitCode: 1,
+              stderr: 'module not found',
+              timeout: false,
+            },
+          });
+        },
+      });
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const res = await auth(request(app).post('/workspace/mcp/servers'))
+        .set('X-Qwen-Client-Id', 'client-1')
+        .send({ name: 'broken', config: { command: 'bad-cmd' } });
+      expect(res.status).toBe(502);
+      expect(res.body).toMatchObject({
+        code: 'mcp_server_spawn_failed',
+        serverName: 'broken',
+        exitCode: 1,
+        stderr: 'module not found',
+      });
+    });
+
+    it('503 acp_channel_unavailable when bridge throws with that errorKind', async () => {
+      const bridge = fakeBridge({
+        knownClientIds: ['client-1'],
+        addRuntimeMcpServerImpl: async () => {
+          throw Object.assign(new Error('No ACP channel'), {
+            data: { errorKind: 'acp_channel_unavailable' },
+          });
+        },
+      });
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const res = await auth(request(app).post('/workspace/mcp/servers'))
+        .set('X-Qwen-Client-Id', 'client-1')
+        .send({ name: 'echo', config: { command: 'echo' } });
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('acp_channel_unavailable');
+    });
+  });
+
+  describe('DELETE /workspace/mcp/servers/:name (T2.8 #4514)', () => {
+    const tokenOpts: ServeOptions = { ...baseOpts, token: 'secret' };
+    const auth = (req: request.Test): request.Test =>
+      req
+        .set('Host', `127.0.0.1:${tokenOpts.port}`)
+        .set('Authorization', 'Bearer secret');
+
+    it('200 removed:true with wasShadowingSettings:false', async () => {
+      const bridge = fakeBridge({ knownClientIds: ['client-1'] });
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const res = await auth(request(app).delete('/workspace/mcp/servers/echo'))
+        .set('X-Qwen-Client-Id', 'client-1')
+        .send();
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        name: 'echo',
+        removed: true,
+        wasShadowingSettings: false,
+        originatorClientId: 'client-1',
+      });
+      expect(bridge.removeRuntimeMcpServerCalls).toHaveLength(1);
+      expect(bridge.removeRuntimeMcpServerCalls[0]).toMatchObject({
+        name: 'echo',
+        originatorClientId: 'client-1',
+      });
+    });
+
+    it('200 skipped:true when server not present (idempotent)', async () => {
+      const bridge = fakeBridge({
+        knownClientIds: ['client-1'],
+        removeRuntimeMcpServerImpl: async (name) => ({
+          name,
+          skipped: true as const,
+          reason: 'not_present' as const,
+        }),
+      });
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const res = await auth(
+        request(app).delete('/workspace/mcp/servers/ghost'),
+      )
+        .set('X-Qwen-Client-Id', 'client-1')
+        .send();
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        name: 'ghost',
+        skipped: true,
+        reason: 'not_present',
+      });
+    });
+
+    it('200 removed:true with wasShadowingSettings:true', async () => {
+      const bridge = fakeBridge({
+        knownClientIds: ['client-1'],
+        removeRuntimeMcpServerImpl: async (name, originatorClientId) => ({
+          name,
+          removed: true as const,
+          wasShadowingSettings: true,
+          originatorClientId,
+        }),
+      });
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const res = await auth(
+        request(app).delete('/workspace/mcp/servers/shadowed-srv'),
+      )
+        .set('X-Qwen-Client-Id', 'client-1')
+        .send();
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        name: 'shadowed-srv',
+        removed: true,
+        wasShadowingSettings: true,
+        originatorClientId: 'client-1',
+      });
+    });
+
+    it('400 invalid_server_name when path param has illegal chars', async () => {
+      const bridge = fakeBridge({ knownClientIds: ['client-1'] });
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const res = await auth(
+        request(app).delete('/workspace/mcp/servers/bad%2Fname'),
+      )
+        .set('X-Qwen-Client-Id', 'client-1')
+        .send();
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('invalid_server_name');
+      expect(bridge.removeRuntimeMcpServerCalls).toHaveLength(0);
+    });
+
+    it('400 invalid_server_name when name exceeds MAX_SERVER_NAME_LENGTH', async () => {
+      const bridge = fakeBridge({ knownClientIds: ['client-1'] });
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const overlong = 'a'.repeat(257);
+      const res = await auth(
+        request(app).delete(`/workspace/mcp/servers/${overlong}`),
+      )
+        .set('X-Qwen-Client-Id', 'client-1')
+        .send();
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('invalid_server_name');
+      expect(bridge.removeRuntimeMcpServerCalls).toHaveLength(0);
+    });
+
+    it('400 invalid_server_name when name is a reserved JS property', async () => {
+      for (const name of ['__proto__', 'constructor', 'prototype']) {
+        const bridge = fakeBridge({ knownClientIds: ['client-1'] });
+        const app = createServeApp(tokenOpts, undefined, { bridge });
+        const res = await auth(
+          request(app).delete(`/workspace/mcp/servers/${name}`),
+        )
+          .set('X-Qwen-Client-Id', 'client-1')
+          .send();
+        expect(res.status).toBe(400);
+        expect(res.body.code).toBe('invalid_server_name');
+        expect(res.body.error).toContain('reserved');
+        expect(bridge.removeRuntimeMcpServerCalls).toHaveLength(0);
+      }
+    });
+
+    it('401 auth_required when no bearer token (strict gate)', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp(baseOpts, undefined, { bridge });
+      const res = await request(app)
+        .delete('/workspace/mcp/servers/echo')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .send();
+      expect(res.status).toBe(401);
+      expect(bridge.removeRuntimeMcpServerCalls).toHaveLength(0);
+    });
+
+    it('400 invalid_client_id on unknown X-Qwen-Client-Id', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp(tokenOpts, undefined, { bridge });
+      const res = await auth(request(app).delete('/workspace/mcp/servers/echo'))
+        .set('X-Qwen-Client-Id', 'forged-client')
+        .send();
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({
+        code: 'invalid_client_id',
+        clientId: 'forged-client',
+      });
+      expect(bridge.removeRuntimeMcpServerCalls).toHaveLength(0);
+    });
+  });
+
   describe('POST /workspace/tools/:name/enable (#4175 Wave 4 PR 17)', () => {
     const tokenOpts: ServeOptions = { ...baseOpts, token: 'secret' };
     const auth = (req: request.Test): request.Test =>
@@ -3887,6 +4323,307 @@ describe('createServeApp', () => {
         .set('X-Qwen-Client-Id', 'bad-client');
       expect(res.status).toBe(400);
       expect(res.body.code).toBe('invalid_client_id');
+    });
+  });
+
+  describe('POST /sessions/delete', () => {
+    let previousRuntimeDir: string | undefined;
+    let runtimeDir: string;
+    let wsDir: string;
+
+    beforeEach(async () => {
+      previousRuntimeDir = process.env['QWEN_RUNTIME_DIR'];
+      runtimeDir = await fsp.mkdtemp(
+        path.join(os.tmpdir(), 'qwen-serve-batch-delete-'),
+      );
+      process.env['QWEN_RUNTIME_DIR'] = runtimeDir;
+      wsDir = realpathSync(runtimeDir);
+    });
+
+    afterEach(async () => {
+      if (previousRuntimeDir === undefined) {
+        delete process.env['QWEN_RUNTIME_DIR'];
+      } else {
+        process.env['QWEN_RUNTIME_DIR'] = previousRuntimeDir;
+      }
+      await fsp.rm(runtimeDir, { recursive: true, force: true });
+    });
+
+    async function writeSession(sessionId: string): Promise<void> {
+      const chatsDir = path.join(new Storage(wsDir).getProjectDir(), 'chats');
+      await fsp.mkdir(chatsDir, { recursive: true });
+      const filePath = path.join(chatsDir, `${sessionId}.jsonl`);
+      const record = {
+        uuid: `${sessionId}-user-1`,
+        parentUuid: null,
+        sessionId,
+        timestamp: '2026-05-28T12:00:00.000Z',
+        type: 'user',
+        message: { role: 'user', parts: [{ text: 'hello' }] },
+        cwd: wsDir,
+      };
+      await fsp.writeFile(filePath, `${JSON.stringify(record)}\n`, 'utf8');
+    }
+
+    it('400 on missing sessionIds', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp({ ...baseOpts, workspace: wsDir }, undefined, {
+        bridge,
+        boundWorkspace: wsDir,
+      });
+      const res = await request(app)
+        .post('/sessions/delete')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .send({});
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('invalid_request');
+    });
+
+    it('400 on empty sessionIds array', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp({ ...baseOpts, workspace: wsDir }, undefined, {
+        bridge,
+        boundWorkspace: wsDir,
+      });
+      const res = await request(app)
+        .post('/sessions/delete')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .send({ sessionIds: [] });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('invalid_request');
+    });
+
+    it('deletes active session and its transcript when bridge succeeds', async () => {
+      const sid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+      await writeSession(sid);
+      const bridge = fakeBridge();
+      const app = createServeApp({ ...baseOpts, workspace: wsDir }, undefined, {
+        bridge,
+        boundWorkspace: wsDir,
+      });
+      const res = await request(app)
+        .post('/sessions/delete')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .send({ sessionIds: [sid] });
+      expect(res.status).toBe(200);
+      expect(res.body.removed).toEqual([sid]);
+      expect(res.body.notFound).toEqual([]);
+      expect(res.body.errors).toEqual([]);
+      const chatsDir = path.join(new Storage(wsDir).getProjectDir(), 'chats');
+      const filePath = path.join(chatsDir, `${sid}.jsonl`);
+      await expect(fsp.access(filePath)).rejects.toThrow();
+    });
+
+    it('deletes inactive session transcript when bridge throws SessionNotFoundError', async () => {
+      const sid = 'deadbeef-dead-beef-dead-beefdeaddead';
+      await writeSession(sid);
+      const bridge = fakeBridge({
+        closeImpl: async (sessionId) => {
+          throw new SessionNotFoundError(sessionId);
+        },
+      });
+      const app = createServeApp({ ...baseOpts, workspace: wsDir }, undefined, {
+        bridge,
+        boundWorkspace: wsDir,
+      });
+      const res = await request(app)
+        .post('/sessions/delete')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .send({ sessionIds: [sid] });
+      expect(res.status).toBe(200);
+      expect(res.body.removed).toEqual([sid]);
+      expect(res.body.errors).toEqual([]);
+      const chatsDir = path.join(new Storage(wsDir).getProjectDir(), 'chats');
+      const filePath = path.join(chatsDir, `${sid}.jsonl`);
+      await expect(fsp.access(filePath)).rejects.toThrow();
+    });
+
+    it('does not delete when bridge.closeSession throws InvalidClientIdError', async () => {
+      const sid = 'aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb';
+      await writeSession(sid);
+      const bridge = fakeBridge({
+        closeImpl: async (sessionId) => {
+          throw new InvalidClientIdError(sessionId, 'bad-client');
+        },
+      });
+      const app = createServeApp({ ...baseOpts, workspace: wsDir }, undefined, {
+        bridge,
+        boundWorkspace: wsDir,
+      });
+      const res = await request(app)
+        .post('/sessions/delete')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .set('X-Qwen-Client-Id', 'bad-client')
+        .send({ sessionIds: [sid] });
+      expect(res.status).toBe(200);
+      expect(res.body.removed).toEqual([]);
+      expect(res.body.errors).toHaveLength(1);
+      expect(res.body.errors[0].sessionId).toBe(sid);
+    });
+
+    it('returns notFound for sessions without persisted data', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp({ ...baseOpts, workspace: wsDir }, undefined, {
+        bridge,
+        boundWorkspace: wsDir,
+      });
+      const res = await request(app)
+        .post('/sessions/delete')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .send({ sessionIds: ['nonexistent'] });
+      expect(res.status).toBe(200);
+      expect(res.body.removed).toEqual([]);
+      expect(res.body.notFound).toEqual(['nonexistent']);
+    });
+
+    it('errors array contains string messages, not Error objects', async () => {
+      const bridge = fakeBridge({
+        closeImpl: async () => {
+          throw new Error('bridge exploded');
+        },
+      });
+      const app = createServeApp({ ...baseOpts, workspace: wsDir }, undefined, {
+        bridge,
+        boundWorkspace: wsDir,
+      });
+      const res = await request(app)
+        .post('/sessions/delete')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .send({ sessionIds: ['s-1'] });
+      expect(res.status).toBe(200);
+      expect(res.body.errors[0].error).toBe('bridge exploded');
+      expect(typeof res.body.errors[0].error).toBe('string');
+    });
+
+    it('handles multi-session batch with mixed outcomes', async () => {
+      const sidOk = 'aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee';
+      const sidNotFound = 'aaaa2222-bbbb-cccc-dddd-eeeeeeeeeeee';
+      const sidFail = 'aaaa3333-bbbb-cccc-dddd-eeeeeeeeeeee';
+      await writeSession(sidOk);
+      await writeSession(sidNotFound);
+      await writeSession(sidFail);
+      const bridge = fakeBridge({
+        closeImpl: async (sessionId) => {
+          if (sessionId === sidNotFound) {
+            throw new SessionNotFoundError(sessionId);
+          }
+          if (sessionId === sidFail) {
+            throw new Error('agent busy');
+          }
+        },
+      });
+      const app = createServeApp({ ...baseOpts, workspace: wsDir }, undefined, {
+        bridge,
+        boundWorkspace: wsDir,
+      });
+      const res = await request(app)
+        .post('/sessions/delete')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .send({ sessionIds: [sidOk, sidNotFound, sidFail] });
+      expect(res.status).toBe(200);
+      expect(res.body.removed.sort()).toEqual([sidNotFound, sidOk].sort());
+      expect(res.body.errors).toHaveLength(1);
+      expect(res.body.errors[0].sessionId).toBe(sidFail);
+      expect(res.body.errors[0].error).toBe('agent busy');
+      const chatsDir = path.join(new Storage(wsDir).getProjectDir(), 'chats');
+      await expect(
+        fsp.access(path.join(chatsDir, `${sidOk}.jsonl`)),
+      ).rejects.toThrow();
+      await expect(
+        fsp.access(path.join(chatsDir, `${sidNotFound}.jsonl`)),
+      ).rejects.toThrow();
+      await expect(
+        fsp.access(path.join(chatsDir, `${sidFail}.jsonl`)),
+      ).resolves.toBeUndefined();
+    });
+
+    it('400 when sessionIds exceeds max 100', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp({ ...baseOpts, workspace: wsDir }, undefined, {
+        bridge,
+        boundWorkspace: wsDir,
+      });
+      const ids = Array.from({ length: 101 }, (_, i) => `s-${i}`);
+      const res = await request(app)
+        .post('/sessions/delete')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .send({ sessionIds: ids });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('invalid_request');
+    });
+
+    it('400 when sessionIds contains non-string elements', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp({ ...baseOpts, workspace: wsDir }, undefined, {
+        bridge,
+        boundWorkspace: wsDir,
+      });
+      const res = await request(app)
+        .post('/sessions/delete')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .send({ sessionIds: [123, true] });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('invalid_request');
+    });
+
+    it('deduplicates sessionIds and calls closeSession once per unique id', async () => {
+      const sid = 'ddddd111-bbbb-cccc-dddd-eeeeeeeeeeee';
+      await writeSession(sid);
+      const bridge = fakeBridge();
+      const app = createServeApp({ ...baseOpts, workspace: wsDir }, undefined, {
+        bridge,
+        boundWorkspace: wsDir,
+      });
+      const res = await request(app)
+        .post('/sessions/delete')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .send({ sessionIds: [sid, sid] });
+      expect(res.status).toBe(200);
+      expect(res.body.removed).toEqual([sid]);
+      expect(bridge.closeCalls).toHaveLength(1);
+    });
+
+    it('preserves transcript file when bridge.closeSession throws non-SessionNotFoundError', async () => {
+      const sid = 'eeee1111-bbbb-cccc-dddd-eeeeeeeeeeee';
+      await writeSession(sid);
+      const bridge = fakeBridge({
+        closeImpl: async (sessionId) => {
+          throw new InvalidClientIdError(sessionId, 'bad-client');
+        },
+      });
+      const app = createServeApp({ ...baseOpts, workspace: wsDir }, undefined, {
+        bridge,
+        boundWorkspace: wsDir,
+      });
+      const res = await request(app)
+        .post('/sessions/delete')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .send({ sessionIds: [sid] });
+      expect(res.status).toBe(200);
+      expect(res.body.removed).toEqual([]);
+      expect(res.body.errors).toHaveLength(1);
+      const chatsDir = path.join(new Storage(wsDir).getProjectDir(), 'chats');
+      await expect(
+        fsp.access(path.join(chatsDir, `${sid}.jsonl`)),
+      ).resolves.toBeUndefined();
+    });
+
+    it('returns 500 when removeSessions throws unexpectedly', async () => {
+      const spy = vi
+        .spyOn(SessionService.prototype, 'removeSessions')
+        .mockRejectedValueOnce(new Error('disk on fire'));
+      const bridge = fakeBridge();
+      const app = createServeApp({ ...baseOpts, workspace: wsDir }, undefined, {
+        bridge,
+        boundWorkspace: wsDir,
+      });
+      const res = await request(app)
+        .post('/sessions/delete')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .send({ sessionIds: ['aaaa0000-bbbb-cccc-dddd-eeeeeeeeeeee'] });
+      expect(res.status).toBe(500);
+      expect(res.body.code).toBe('sessions_delete_failed');
+      spy.mockRestore();
     });
   });
 

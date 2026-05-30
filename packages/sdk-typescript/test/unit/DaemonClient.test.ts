@@ -1134,6 +1134,53 @@ describe('DaemonClient', () => {
     });
   });
 
+  describe('deleteSessionsData', () => {
+    it('POSTs to /sessions/delete with sessionIds in body and returns result', async () => {
+      const result = {
+        removed: ['s-1', 's-2'],
+        notFound: ['s-3'],
+        errors: [],
+      };
+      const { fetch, calls } = recordingFetch(() => jsonResponse(200, result));
+      const client = new DaemonClient({ baseUrl: 'http://daemon', fetch });
+      const res = await client.deleteSessionsData(['s-1', 's-2', 's-3']);
+      expect(res).toEqual(result);
+      expect(calls[0]?.url).toBe('http://daemon/sessions/delete');
+      expect(calls[0]?.method).toBe('POST');
+      expect(JSON.parse(calls[0]!.body!)).toEqual({
+        sessionIds: ['s-1', 's-2', 's-3'],
+      });
+    });
+
+    it('sends client identity header', async () => {
+      const { fetch, calls } = recordingFetch(() =>
+        jsonResponse(200, { removed: [], notFound: [], errors: [] }),
+      );
+      const client = new DaemonClient({ baseUrl: 'http://daemon', fetch });
+      await client.deleteSessionsData(['s-1'], 'client-1');
+      expect(calls[0]?.headers['x-qwen-client-id']).toBe('client-1');
+    });
+
+    it('sends Content-Type application/json', async () => {
+      const { fetch, calls } = recordingFetch(() =>
+        jsonResponse(200, { removed: [], notFound: [], errors: [] }),
+      );
+      const client = new DaemonClient({ baseUrl: 'http://daemon', fetch });
+      await client.deleteSessionsData(['s-1']);
+      expect(calls[0]?.headers['content-type']).toBe('application/json');
+    });
+
+    it('throws DaemonHttpError on non-2xx', async () => {
+      const { fetch } = recordingFetch(() =>
+        jsonResponse(500, { error: 'boom' }),
+      );
+      const client = new DaemonClient({ baseUrl: 'http://daemon', fetch });
+      await expect(client.deleteSessionsData(['s-1'])).rejects.toBeInstanceOf(
+        DaemonHttpError,
+      );
+    });
+  });
+
   describe('updateSessionMetadata', () => {
     it('sends PATCH to /session/:id/metadata and returns effective metadata', async () => {
       const { fetch, calls } = recordingFetch(() =>
@@ -2332,6 +2379,75 @@ describe('DaemonClient', () => {
           DaemonHttpError,
         );
       }
+    });
+  });
+
+  describe('addRuntimeMcpServer (T2.8 #4514)', () => {
+    it('POSTs /workspace/mcp/servers with JSON body and returns the typed result', async () => {
+      const result = {
+        name: 'my-server',
+        transport: 'stdio',
+        replaced: false,
+        shadowedSettings: false,
+        toolCount: 3,
+        originatorClientId: 'client-1',
+      };
+      const { fetch, calls } = recordingFetch(() => jsonResponse(200, result));
+      const client = new DaemonClient({ baseUrl: 'http://daemon', fetch });
+      const res = await client.addRuntimeMcpServer({
+        name: 'my-server',
+        config: { command: 'node', args: ['server.js'] },
+      });
+      expect(res).toEqual(result);
+      expect(calls[0]?.url).toBe('http://daemon/workspace/mcp/servers');
+      expect(calls[0]?.method).toBe('POST');
+      expect(calls[0]?.headers['content-type']).toBe('application/json');
+      expect(JSON.parse(calls[0]!.body!)).toEqual({
+        name: 'my-server',
+        config: { command: 'node', args: ['server.js'] },
+      });
+    });
+
+    it('throws DaemonHttpError on non-2xx', async () => {
+      const { fetch } = recordingFetch(() =>
+        jsonResponse(400, { error: 'invalid config' }),
+      );
+      const client = new DaemonClient({ baseUrl: 'http://daemon', fetch });
+      await expect(
+        client.addRuntimeMcpServer({
+          name: 'bad',
+          config: { command: '' },
+        }),
+      ).rejects.toMatchObject({ status: 400 });
+    });
+  });
+
+  describe('removeRuntimeMcpServer (T2.8 #4514)', () => {
+    it('DELETEs /workspace/mcp/servers/:name with URL-encoded name', async () => {
+      const result = {
+        name: 'my server',
+        removed: true,
+        wasShadowingSettings: false,
+        originatorClientId: 'client-1',
+      };
+      const { fetch, calls } = recordingFetch(() => jsonResponse(200, result));
+      const client = new DaemonClient({ baseUrl: 'http://daemon', fetch });
+      const res = await client.removeRuntimeMcpServer('my server');
+      expect(res).toEqual(result);
+      expect(calls[0]?.url).toBe(
+        'http://daemon/workspace/mcp/servers/my%20server',
+      );
+      expect(calls[0]?.method).toBe('DELETE');
+    });
+
+    it('throws DaemonHttpError on non-2xx', async () => {
+      const { fetch } = recordingFetch(() =>
+        jsonResponse(500, { error: 'internal' }),
+      );
+      const client = new DaemonClient({ baseUrl: 'http://daemon', fetch });
+      await expect(
+        client.removeRuntimeMcpServer('ghost'),
+      ).rejects.toMatchObject({ status: 500 });
     });
   });
 

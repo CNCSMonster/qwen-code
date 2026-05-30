@@ -53,6 +53,9 @@ import type {
   DaemonMcpRestartResult,
   DaemonSessionRecapResult,
   DaemonShellCommandResult,
+  DaemonRuntimeMcpAddRequest,
+  DaemonRuntimeMcpAddResult,
+  DaemonRuntimeMcpRemoveResult,
   DaemonToolToggleResult,
 } from './types.js';
 
@@ -1264,6 +1267,69 @@ export class DaemonClient {
   }
 
   /**
+   * T2.8 (#4514). Add (or replace) a runtime MCP server. The daemon
+   * validates the config, starts the server, and emits an
+   * `mcp_server_added` SSE event to all live sessions. Callers
+   * pre-flight `caps.features.mcp_server_runtime_mutation` before
+   * calling — older daemons return 404.
+   */
+  async addRuntimeMcpServer(
+    request: DaemonRuntimeMcpAddRequest,
+    opts?: { clientId?: string; timeoutMs?: number },
+  ): Promise<DaemonRuntimeMcpAddResult> {
+    return await this.fetchWithTimeout(
+      `${this.baseUrl}/workspace/mcp/servers`,
+      {
+        method: 'POST',
+        headers: this.headers(
+          { 'Content-Type': 'application/json' },
+          opts?.clientId,
+        ),
+        body: JSON.stringify(request),
+      },
+      async (res) => {
+        if (!res.ok) {
+          throw await this.failOnError(res, 'POST /workspace/mcp/servers');
+        }
+        return (await res.json()) as DaemonRuntimeMcpAddResult;
+      },
+      opts?.timeoutMs ?? MCP_RESTART_DEFAULT_TIMEOUT_MS,
+    );
+  }
+
+  /**
+   * T2.8 (#4514). Remove a runtime MCP server by name. The daemon
+   * tears down the server process, removes it from the runtime
+   * overlay, and emits an `mcp_server_removed` SSE event. Idempotent
+   * at the HTTP level: if the server was never present the daemon
+   * returns 200 with `{ skipped: true, reason: 'not_present' }`.
+   * Pre-flight `caps.features.mcp_server_runtime_mutation` before
+   * calling.
+   */
+  async removeRuntimeMcpServer(
+    name: string,
+    opts?: { clientId?: string; timeoutMs?: number },
+  ): Promise<DaemonRuntimeMcpRemoveResult> {
+    return await this.fetchWithTimeout(
+      `${this.baseUrl}/workspace/mcp/servers/${encodeURIComponent(name)}`,
+      {
+        method: 'DELETE',
+        headers: this.headers({}, opts?.clientId),
+      },
+      async (res) => {
+        if (!res.ok) {
+          throw await this.failOnError(
+            res,
+            'DELETE /workspace/mcp/servers/:name',
+          );
+        }
+        return (await res.json()) as DaemonRuntimeMcpRemoveResult;
+      },
+      opts?.timeoutMs ?? MCP_RESTART_DEFAULT_TIMEOUT_MS,
+    );
+  }
+
+  /**
    * #4175 Wave 4 PR 17. Scaffold a `QWEN.md` at the daemon's bound
    * workspace root. Mechanical only — does NOT invoke the LLM. The
    * daemon writes an empty file; clients that want AI-driven content
@@ -1696,6 +1762,34 @@ export class DaemonClient {
           return;
         }
         throw await this.failOnError(res, 'DELETE /session/:id');
+      },
+    );
+  }
+
+  async deleteSessionsData(
+    sessionIds: string[],
+    clientId?: string,
+  ): Promise<{
+    removed: string[];
+    notFound: string[];
+    errors: Array<{ sessionId: string; error: string }>;
+  }> {
+    return await this.fetchWithTimeout(
+      `${this.baseUrl}/sessions/delete`,
+      {
+        method: 'POST',
+        headers: this.headers({ 'Content-Type': 'application/json' }, clientId),
+        body: JSON.stringify({ sessionIds }),
+      },
+      async (res) => {
+        if (res.ok) {
+          return (await res.json()) as {
+            removed: string[];
+            notFound: string[];
+            errors: Array<{ sessionId: string; error: string }>;
+          };
+        }
+        throw await this.failOnError(res, 'POST /sessions/delete');
       },
     );
   }

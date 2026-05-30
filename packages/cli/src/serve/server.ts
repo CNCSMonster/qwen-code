@@ -7,12 +7,17 @@
 import * as crypto from 'node:crypto';
 import * as path from 'node:path';
 import express from 'express';
-import type { Application } from 'express';
+import type { Application, NextFunction, Request, Response } from 'express';
 import type { ApprovalMode } from '@qwen-code/qwen-code-core';
 import {
   APPROVAL_MODES,
   SessionService,
   TrustGateError,
+  emitDaemonLog,
+  hashDaemonWorkspace,
+  recordDaemonError,
+  recordDaemonHttpResponse,
+  withDaemonRequestSpan,
 } from '@qwen-code/qwen-code-core';
 import { writeStderrLine } from '../utils/stdioHelpers.js';
 import type { DaemonLogger } from './daemonLogger.js';
@@ -270,6 +275,73 @@ export interface ServeAppDeps {
    * stderr-only behavior.
    */
   daemonLog?: DaemonLogger;
+}
+
+function resolveDaemonTelemetryRoute(
+  req: Request,
+): { route: string; sessionId?: string } | undefined {
+  if (req.method === 'POST' && req.path === '/session') {
+    return { route: 'POST /session' };
+  }
+  const sessionAction = req.path.match(
+    /^\/session\/([^/]+)\/(load|resume|prompt|cancel)$/,
+  );
+  const sessionActionId = sessionAction?.[1];
+  const sessionActionName = sessionAction?.[2];
+  if (sessionActionId && sessionActionName && req.method === 'POST') {
+    return {
+      route: `POST /session/:id/${sessionActionName}`,
+      sessionId: sessionActionId,
+    };
+  }
+  const deleteSession = req.path.match(/^\/session\/([^/]+)$/);
+  const deleteSessionId = deleteSession?.[1];
+  if (deleteSessionId && req.method === 'DELETE') {
+    return { route: 'DELETE /session/:id', sessionId: deleteSessionId };
+  }
+  if (req.method === 'GET' && /^\/workspace\/.+\/sessions$/.test(req.path)) {
+    return { route: 'GET /workspace/:id/sessions' };
+  }
+  return undefined;
+}
+
+function daemonTelemetryMiddleware(
+  boundWorkspace: string,
+): (req: Request, res: Response, next: NextFunction) => void {
+  const workspaceHash = hashDaemonWorkspace(boundWorkspace);
+  return (req, res, next) => {
+    const route = resolveDaemonTelemetryRoute(req);
+    if (!route) {
+      next();
+      return;
+    }
+    void withDaemonRequestSpan(
+      {
+        method: req.method,
+        route: route.route,
+        workspaceHash,
+        ...(route.sessionId ? { sessionId: route.sessionId } : {}),
+      },
+      async (span) =>
+        await new Promise<void>((resolve, reject) => {
+          let done = false;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            recordDaemonHttpResponse(span, res.statusCode);
+            resolve();
+          };
+          res.once('finish', finish);
+          res.once('close', finish);
+          try {
+            next();
+          } catch (error) {
+            recordDaemonError(span, error);
+            reject(error);
+          }
+        }),
+    ).catch(next);
+  };
 }
 
 /**
@@ -759,6 +831,59 @@ export function createServeApp(
     app.get('/demo', demoHandler);
   }
 
+  // Access-log middleware. Registered BEFORE bearerAuth and JSON parser
+  // so auth rejections (401) and malformed-body errors (400) are also
+  // captured in the daemon log. Excluded:
+  //  - GET /health (high-frequency probe, would drown signal)
+  //  - Successful SSE streams (GET .../events with 200) — logged inline
+  //    at open/close; failed SSE handshakes (4xx) are still recorded.
+  if (daemonLog) {
+    const SESSION_ID_RE = /\/session\/([^/]+)/;
+    app.use((req, res, next) => {
+      const { method, path: reqPath } = req;
+      if (
+        (method === 'GET' && reqPath === '/health') ||
+        (method === 'POST' && reqPath.endsWith('/heartbeat'))
+      ) {
+        return next();
+      }
+      const startMs = Date.now();
+      res.on('finish', () => {
+        try {
+          const status = res.statusCode;
+          if (
+            method === 'GET' &&
+            reqPath.endsWith('/events') &&
+            status === 200
+          ) {
+            return;
+          }
+          const durationMs = Date.now() - startMs;
+          const sessionMatch = reqPath.match(SESSION_ID_RE);
+          const sessionId = sessionMatch?.[1];
+          const clientId = req.headers['x-qwen-client-id'] as
+            | string
+            | undefined;
+          const ctx = {
+            route: `${method} ${reqPath}`,
+            ...(sessionId ? { sessionId } : {}),
+            ...(clientId ? { clientId } : {}),
+            status,
+            durationMs,
+          };
+          if (status >= 400) {
+            daemonLog.warn('request completed', ctx);
+          } else {
+            daemonLog.info('request completed', ctx);
+          }
+        } catch {
+          // Logging failure must not affect the request.
+        }
+      });
+      next();
+    });
+  }
+
   app.use(bearerAuth(opts.token));
 
   app.use(express.json({ limit: '10mb' }));
@@ -795,6 +920,8 @@ export function createServeApp(
     tokenConfigured: opts.token !== undefined,
     requireAuth: opts.requireAuth === true,
   });
+
+  app.use(daemonTelemetryMiddleware(boundWorkspace));
 
   app.get('/capabilities', (_req, res) => {
     const envelope: CapabilitiesEnvelope = {
@@ -1265,7 +1392,22 @@ export function createServeApp(
       // The disconnect-without-reap branch also needs to skip
       // `res.json` — writing to a closed socket would throw EPIPE
       // through Express's default error handler.
+      if (daemonLog) {
+        daemonLog.info(
+          session.attached ? 'session attached' : 'session spawned',
+          { sessionId: session.sessionId, clientId: session.clientId },
+        );
+      }
       if (!res.writable) {
+        if (daemonLog) {
+          daemonLog.warn(
+            'session reaped (client disconnected before response)',
+            {
+              sessionId: session.sessionId,
+              attached: session.attached,
+            },
+          );
+        }
         if (!session.attached) {
           // `requireZeroAttaches: true` closes the BQ9tV race: if
           // a second client called `spawnOrAttach` for the same
@@ -1328,6 +1470,12 @@ export function createServeApp(
                 workspaceCwd: cwd,
                 ...(clientId !== undefined ? { clientId } : {}),
               });
+        if (daemonLog) {
+          daemonLog.info(
+            `session ${action}${session.attached ? ' (attached)' : ''}`,
+            { sessionId: session.sessionId, clientId: session.clientId },
+          );
+        }
         // Mirror the `POST /session` disconnect-cleanup path (see the
         // long comment above the matching `if (!res.writable)` there
         // for the rationale around `res.writable` vs `req.aborted` /
@@ -1528,11 +1676,34 @@ export function createServeApp(
           promptId,
         },
       )
+      .then(
+        () => {
+          if (daemonLog) {
+            daemonLog.info('prompt turn completed', {
+              sessionId,
+              promptId,
+              clientId,
+            });
+          }
+        },
+        (err) => {
+          if (daemonLog) {
+            const errName = err instanceof Error ? err.name : undefined;
+            daemonLog.warn(
+              `prompt turn failed: ${errName ? `[${errName}] ` : ''}${err instanceof Error ? err.message : String(err)}`,
+              { sessionId, promptId, clientId },
+            );
+          }
+        },
+      )
       .finally(() => {
         if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
       })
       .catch(() => {});
 
+    if (daemonLog) {
+      daemonLog.info('prompt enqueued', { sessionId, promptId, clientId });
+    }
     res.status(202).json({ promptId, lastEventId });
   });
 
@@ -1602,6 +1773,9 @@ export function createServeApp(
         } as Parameters<HttpAcpBridge['cancelSession']>[1],
         clientId !== undefined ? { clientId } : undefined,
       );
+      if (daemonLog) {
+        daemonLog.info('cancel sent', { sessionId, clientId });
+      }
       res.status(204).end();
     } catch (err) {
       sendBridgeError(res, err, {
@@ -1625,6 +1799,87 @@ export function createServeApp(
       sendBridgeError(res, err, {
         route: 'DELETE /session/:id',
         sessionId,
+      });
+    }
+  });
+
+  app.post('/sessions/delete', mutate(), async (req, res) => {
+    const clientId = parseClientIdHeader(req, res);
+    if (clientId === null) return;
+    const body = safeBody(req);
+    const sessionIds: unknown = body['sessionIds'];
+    if (
+      !Array.isArray(sessionIds) ||
+      sessionIds.length === 0 ||
+      sessionIds.length > 100 ||
+      !sessionIds.every((id) => typeof id === 'string')
+    ) {
+      res.status(400).json({
+        error: '`sessionIds` must be a non-empty string array (max 100)',
+        code: 'invalid_request',
+      });
+      return;
+    }
+    try {
+      const uniqueIds = [...new Set(sessionIds as string[])];
+      const closeResults = await Promise.allSettled(
+        uniqueIds.map(async (id) => {
+          // Intentional: no clientId — batch delete bypasses per-tab ownership.
+          await bridge.closeSession(id);
+          return id;
+        }),
+      );
+      const closeErrors: Array<{ sessionId: string; error: string }> = [];
+      const closedIds: string[] = [];
+      for (let i = 0; i < closeResults.length; i++) {
+        const r = closeResults[i];
+        const id = uniqueIds[i];
+        if (r.status === 'fulfilled') {
+          closedIds.push(id);
+        } else {
+          const closeErr = r.reason;
+          if (closeErr instanceof SessionNotFoundError) {
+            // Session not active in bridge — still attempt to remove its transcript file
+            closedIds.push(id);
+          } else {
+            const msg =
+              closeErr instanceof Error ? closeErr.message : String(closeErr);
+            writeStderrLine(
+              `qwen serve: closeSession failed for ${safeLogValue(id)}: ${safeLogValue(msg)}`,
+            );
+            closeErrors.push({ sessionId: id, error: msg });
+          }
+        }
+      }
+      const result = await new SessionService(boundWorkspace).removeSessions(
+        closedIds,
+      );
+      for (const e of result.errors) {
+        const msg =
+          e.error instanceof Error ? e.error.message : String(e.error);
+        writeStderrLine(
+          `qwen serve: removeSession failed for ${safeLogValue(e.sessionId)}: ${safeLogValue(msg)}`,
+        );
+      }
+      res.status(200).json({
+        removed: result.removed,
+        notFound: result.notFound,
+        errors: [
+          ...closeErrors,
+          ...result.errors.map((e) => ({
+            sessionId: e.sessionId,
+            error: e.error instanceof Error ? e.error.message : String(e.error),
+          })),
+        ],
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      writeStderrLine(
+        `qwen serve: failed to batch delete sessions: ${safeLogValue(message)}`,
+      );
+      res.status(500).json({
+        error: 'Failed to delete sessions',
+        code: 'sessions_delete_failed',
       });
     }
   });
@@ -1780,6 +2035,13 @@ export function createServeApp(
         sessionId,
         clientId !== undefined ? { clientId } : undefined,
       );
+      if (daemonLog) {
+        const recap = response.recap;
+        daemonLog.info(
+          recap ? `recap generated len=${recap.length}` : 'recap returned null',
+          { sessionId, clientId },
+        );
+      }
       res.status(200).json(response);
     } catch (err) {
       sendBridgeError(res, err, {
@@ -1816,6 +2078,13 @@ export function createServeApp(
         abort.signal,
         clientId !== undefined ? { clientId } : undefined,
       );
+      if (daemonLog) {
+        daemonLog.info('shell command completed', {
+          sessionId,
+          clientId,
+          exitCode: result.exitCode,
+        });
+      }
       res.status(200).json(result);
     } catch (err) {
       if (
@@ -1960,6 +2229,153 @@ export function createServeApp(
       } catch (err) {
         sendBridgeError(res, err, {
           route: 'POST /workspace/mcp/:server/restart',
+        });
+      }
+    },
+  );
+
+  // T2.8 (#4514): Add a runtime MCP server. Validates body.name +
+  // body.config shape, forwards to HttpAcpBridge.addRuntimeMcpServer.
+  // Typed ACP errors (budget-exceeded, spawn-failed, invalid-config) are
+  // propagated via sendBridgeError with errorKind-based HTTP status mapping.
+  app.post(
+    '/workspace/mcp/servers',
+    mutate({ strict: true }),
+    async (req, res) => {
+      const body = safeBody(req);
+      const name = body['name'];
+      // Validate name: must be non-empty string, alphanumeric + _ and -
+      if (typeof name !== 'string' || name.length === 0) {
+        res.status(400).json({
+          error: 'Server name is required and must be a non-empty string',
+          code: 'invalid_server_name',
+        });
+        return;
+      }
+      if (name.length > MAX_SERVER_NAME_LENGTH) {
+        res.status(400).json({
+          error: `Server name exceeds ${MAX_SERVER_NAME_LENGTH}-character limit`,
+          code: 'invalid_server_name',
+        });
+        return;
+      }
+      if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+        res.status(400).json({
+          error:
+            'Server name must contain only alphanumeric characters, underscores, and hyphens',
+          code: 'invalid_server_name',
+        });
+        return;
+      }
+      if (
+        name === '__proto__' ||
+        name === 'constructor' ||
+        name === 'prototype'
+      ) {
+        res.status(400).json({
+          error: 'Server name must not be a reserved JS property name',
+          code: 'invalid_server_name',
+        });
+        return;
+      }
+      // Validate config: must be a non-null object
+      const config = body['config'];
+      if (
+        typeof config !== 'object' ||
+        config === null ||
+        Array.isArray(config)
+      ) {
+        res.status(400).json({
+          error: '`config` must be a non-null object',
+          code: 'missing_required_field',
+          field: 'config',
+        });
+        return;
+      }
+      // Validate client identity (required for runtime MCP mutation)
+      const clientId = parseAndValidateWorkspaceClientId(req, res, bridge);
+      if (clientId === null) return;
+      if (!clientId) {
+        res.status(400).json({
+          error:
+            '`X-Qwen-Client-Id` header is required for runtime MCP mutation',
+          code: 'missing_client_id',
+        });
+        return;
+      }
+      try {
+        const result = await bridge.addRuntimeMcpServer(
+          name,
+          config as Record<string, unknown>,
+          clientId,
+        );
+        res.status(200).json(result);
+      } catch (err) {
+        sendBridgeError(res, err, {
+          route: 'POST /workspace/mcp/servers',
+        });
+      }
+    },
+  );
+
+  // T2.8 (#4514): Remove a runtime MCP server. Validates :name path param,
+  // forwards to HttpAcpBridge.removeRuntimeMcpServer. Idempotent: missing
+  // entry returns 200 {skipped:true, reason:'not_present'}.
+  app.delete(
+    '/workspace/mcp/servers/:name',
+    mutate({ strict: true }),
+    async (req, res) => {
+      const name = req.params['name'] ?? '';
+      if (name.length === 0) {
+        res.status(400).json({
+          error: 'Server name is required',
+          code: 'invalid_server_name',
+        });
+        return;
+      }
+      if (name.length > MAX_SERVER_NAME_LENGTH) {
+        res.status(400).json({
+          error: `Server name exceeds ${MAX_SERVER_NAME_LENGTH}-character limit`,
+          code: 'invalid_server_name',
+        });
+        return;
+      }
+      if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+        res.status(400).json({
+          error:
+            'Server name must contain only alphanumeric characters, underscores, and hyphens',
+          code: 'invalid_server_name',
+        });
+        return;
+      }
+      if (
+        name === '__proto__' ||
+        name === 'constructor' ||
+        name === 'prototype'
+      ) {
+        res.status(400).json({
+          error: 'Server name must not be a reserved JS property name',
+          code: 'invalid_server_name',
+        });
+        return;
+      }
+      // Validate client identity (required for runtime MCP mutation)
+      const clientId = parseAndValidateWorkspaceClientId(req, res, bridge);
+      if (clientId === null) return;
+      if (!clientId) {
+        res.status(400).json({
+          error:
+            '`X-Qwen-Client-Id` header is required for runtime MCP mutation',
+          code: 'missing_client_id',
+        });
+        return;
+      }
+      try {
+        const result = await bridge.removeRuntimeMcpServer(name, clientId);
+        res.status(200).json(result);
+      } catch (err) {
+        sendBridgeError(res, err, {
+          route: 'DELETE /workspace/mcp/servers/:name',
         });
       }
     },
@@ -2201,6 +2617,19 @@ export function createServeApp(
         sessionId,
       });
       return;
+    }
+
+    if (daemonLog) {
+      const sseOpenedAt = Date.now();
+      const sseClientId = req.headers['x-qwen-client-id'] as string | undefined;
+      daemonLog.info('SSE stream opened', { sessionId, clientId: sseClientId });
+      res.on('close', () => {
+        daemonLog.info('SSE stream closed', {
+          sessionId,
+          clientId: sseClientId,
+          durationMs: Date.now() - sseOpenedAt,
+        });
+      });
     }
 
     res.status(200);
@@ -3385,6 +3814,59 @@ function sendBridgeErrorImpl(
     });
     return;
   }
+  // T2.8 (#4514): errors from the ACP child with `data.errorKind` carry
+  // structured error semantics. Map known kinds to stable HTTP status
+  // codes so SDK clients can branch without parsing message text.
+  if (err && typeof err === 'object') {
+    const data = (err as { data?: unknown }).data;
+    if (data && typeof data === 'object') {
+      const kind = (data as { errorKind?: unknown }).errorKind;
+      if (kind === 'mcp_budget_would_exceed') {
+        const d = data as { serverName?: string };
+        res.status(409).json({
+          error: errorMessage(err),
+          code: 'mcp_budget_would_exceed',
+          serverName: d.serverName,
+        });
+        return;
+      }
+      if (kind === 'mcp_server_spawn_failed') {
+        const d = data as {
+          errorKind: string;
+          serverName?: string;
+          exitCode?: number | null;
+          stderr?: string;
+          timeout?: boolean;
+        };
+        res.status(502).json({
+          error: errorMessage(err),
+          code: 'mcp_server_spawn_failed',
+          serverName: d.serverName,
+          exitCode: d.exitCode,
+          stderr: d.stderr,
+          ...(d.timeout !== undefined ? { timeout: d.timeout } : {}),
+        });
+        return;
+      }
+      if (kind === 'invalid_config') {
+        const d = data as { serverName?: string; reason?: string };
+        res.status(400).json({
+          error: errorMessage(err),
+          code: 'invalid_config',
+          serverName: d.serverName,
+          reason: d.reason,
+        });
+        return;
+      }
+      if (kind === 'acp_channel_unavailable') {
+        res.status(503).json({
+          error: errorMessage(err),
+          code: 'acp_channel_unavailable',
+        });
+        return;
+      }
+    }
+  }
   // 5xx is the kind of error operators need to see in their daemon log
   // — bridge ENOMEM, agent stack trace, unexpected throw, etc. Without
   // logging here every 500 disappears once the caller consumes the
@@ -3392,6 +3874,19 @@ function sendBridgeErrorImpl(
   // structured daemon logger (which tees to stderr + log file). When
   // absent (tests, direct embeds), fall back to the legacy stderr-only
   // `writeStderrLine` path.
+  recordDaemonError(undefined, err, {
+    ...(ctx?.route ? { 'http.route': ctx.route } : {}),
+    ...(ctx?.sessionId ? { 'session.id': ctx.sessionId } : {}),
+  });
+  emitDaemonLog('Daemon bridge error.', {
+    ...(ctx?.route ? { 'http.route': ctx.route } : {}),
+    ...(ctx?.sessionId ? { 'session.id': ctx.sessionId } : {}),
+    'error.type': err instanceof Error ? err.name : typeof err,
+    'error.message': (err instanceof Error ? err.message : String(err)).slice(
+      0,
+      1024,
+    ),
+  });
   if (daemonLog) {
     daemonLog.error(
       err instanceof Error ? err.message : String(err),
